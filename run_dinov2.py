@@ -9,6 +9,10 @@ from PIL import Image
 import torchvision.transforms as T
 import warnings
 import math
+from sklearn.decomposition import PCA
+import torch.nn.functional as F
+from tqdm import tqdm
+import sys
 
 # Patch for older PyTorch versions that don't have antialias parameter
 def patch_interpolate():
@@ -35,46 +39,262 @@ def patch_interpolate():
 # Apply the patch at module level
 patch_interpolate()
 
+# DINOv2 feature extractor class
+class DINOv2FeatureExtractor:
+    def __init__(self, model_name='dinov2_vits14'):
+        """Initialize the DINOv2 feature extractor with specified model size"""
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        # For older PyTorch versions, suppress warnings
+        warnings.filterwarnings("ignore", message=".*xFormers.*")
+        
+        try:
+            # Try loading requested model variant
+            print(f"Loading DINOv2 {model_name} model...")
+            self.model = torch.hub.load('facebookresearch/dinov2', model_name)
+            self.model = self.model.to(self.device)
+            self.model.eval()
+        except Exception as e:
+            print(f"Error loading DINOv2 model: {e}")
+            print("Trying DINOv2 ViT-S/14 model as fallback...")
+            try:
+                self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+                self.model = self.model.to(self.device)
+                self.model.eval()
+            except Exception as e:
+                print(f"Error loading alternative model: {e}")
+                print("Using torchvision's ViT model as fallback...")
+                from torchvision.models import vit_b_16, ViT_B_16_Weights
+                self.model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+                self.model = self.model.to(self.device)
+                self.model.eval()
+        
+        # Default transforms for preprocessing
+        self.transform = T.Compose([
+            T.Resize(518),  # Higher resolution for better results
+            T.CenterCrop(518),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def extract_features(self, image):
+        """Extract features from an image using DINOv2"""
+        with torch.no_grad():
+            if isinstance(image, np.ndarray):  # If OpenCV image (BGR)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(image)
+            
+            # Apply transformations
+            img_tensor = self.transform(image).unsqueeze(0).to(self.device)
+            
+            # Extract features
+            if hasattr(self.model, 'get_intermediate_layers'):
+                features = self.model.get_intermediate_layers(img_tensor, n=1)[0]
+            elif hasattr(self.model, 'forward_features'):
+                features = self.model.forward_features(img_tensor)
+                if isinstance(features, dict):
+                    features = features['last_hidden_state'] if 'last_hidden_state' in features else list(features.values())[0]
+            else:
+                features = self.model(img_tensor)
+                if isinstance(features, dict):
+                    features = list(features.values())[0]
+            
+            # Return the features
+            return features
+
+    def extract_patch_features(self, image):
+        """Extract patch tokens from an image, excluding the CLS token"""
+        features = self.extract_features(image)
+        
+        # Handle different feature formats
+        if features.dim() == 3 and features.shape[1] > 1:
+            # Skip the CLS/distillation token (first token)
+            patch_tokens = features[:, 1:, :]
+            return patch_tokens
+        else:
+            # If no CLS token or unexpected format, return as is
+            return features
+
+# Depth estimation model based on DINOv2 features
+class DINOv2DepthEstimator:
+    def __init__(self, feature_extractor):
+        """Initialize depth estimator with a DINOv2 feature extractor"""
+        self.feature_extractor = feature_extractor
+        self.device = feature_extractor.device
+        
+        # Get feature dimension from the feature extractor's model
+        # Default to 384 for ViT-S/14, but try to infer dynamically if possible
+        self.feature_dim = 384  # Default for ViT-S
+        if hasattr(feature_extractor.model, 'embed_dim'):
+            self.feature_dim = feature_extractor.model.embed_dim
+        
+        # Linear regression layer for depth estimation (trained weights would be better)
+        # This is a simple stand-in that should be replaced with a proper model
+        self.depth_regressor = torch.nn.Linear(self.feature_dim, 1).to(self.device)
+        
+        # Initialize with random weights - ideally would load pretrained weights
+        # This will produce noisy but structured depth maps
+        torch.nn.init.normal_(self.depth_regressor.weight, std=0.01)
+        
+    def estimate_depth(self, image):
+        """Estimate depth from an image using DINOv2 features"""
+        # Get patch features from the image
+        patch_features = self.feature_extractor.extract_patch_features(image)
+        
+        # Apply the depth regressor to estimate depth values
+        with torch.no_grad():
+            # Print debug info
+            batch_size, num_patches, feature_dim = patch_features.shape
+            print(f"Patch features shape: [{batch_size}, {num_patches}, {feature_dim}]")
+            
+            # Apply depth regression
+            depth_values = self.depth_regressor(patch_features)
+            
+            # Calculate dimensions for reshaping
+            # For non-square patch grids, we need to find the closest factors
+            # that will accommodate all our patches
+            h = int(math.sqrt(num_patches))
+            
+            # Find the best width given the height to fit all patches
+            w = int(math.ceil(num_patches / h))
+            
+            print(f"Reshaping depth values to: [{batch_size}, {h}, {w}]")
+            
+            # Reshape to 2D grid, possibly with padding
+            # First flatten the depth values
+            depth_values_flat = depth_values.reshape(batch_size, -1)
+            
+            # Create a padded tensor if needed
+            if h * w > num_patches:
+                # Pad with zeros to make it fit the h*w shape
+                padded_depth = torch.zeros(batch_size, h * w, device=self.device)
+                padded_depth[:, :num_patches] = depth_values_flat
+                depth_map = padded_depth.view(batch_size, h, w)
+            else:
+                # If no padding is needed (perfect square)
+                depth_map = depth_values_flat.view(batch_size, h, w)
+            
+            # Apply basic post-processing
+            depth_map = F.interpolate(
+                depth_map.unsqueeze(1), 
+                size=(518, 518), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(1)
+            
+            # Normalize depth values to 0-1 range for visualization
+            normalized_depth = depth_map - depth_map.min()
+            normalized_depth = normalized_depth / (normalized_depth.max() + 1e-8)
+            
+            return normalized_depth.cpu().numpy()[0]
+
+# Semantic segmentation model based on DINOv2 features
+class DINOv2SemanticSegmenter:
+    def __init__(self, feature_extractor, num_clusters=8):
+        """Initialize semantic segmenter with a DINOv2 feature extractor"""
+        self.feature_extractor = feature_extractor
+        self.device = feature_extractor.device
+        self.num_clusters = num_clusters
+        
+        # We'll use simple k-means for clustering features
+        # In production, one would use a learned clustering/segmentation head
+        from sklearn.cluster import KMeans
+        self.kmeans = KMeans(n_clusters=num_clusters, n_init=10)
+        
+        # Flag to track if kmeans has been fitted
+        self.is_fitted = False
+        
+        # Store a buffer of features to fit k-means initially
+        self.feature_buffer = []
+        self.buffer_size = 10
+        
+        # Color map for visualization
+        self.color_map = plt.cm.get_cmap('tab10', num_clusters)
+        
+    def segment_image(self, image):
+        """Perform semantic segmentation using DINOv2 features and k-means clustering"""
+        # Get patch features from the image
+        patch_features = self.feature_extractor.extract_patch_features(image)
+        
+        # Get features for clustering
+        features_for_clustering = patch_features.squeeze(0).cpu().numpy()
+        
+        # If k-means isn't fitted yet, collect features
+        if not self.is_fitted:
+            self.feature_buffer.append(features_for_clustering)
+            if len(self.feature_buffer) >= self.buffer_size:
+                print("Fitting k-means for semantic segmentation...")
+                # Concatenate all features
+                all_features = np.vstack(self.feature_buffer)
+                # Fit k-means on collected features
+                self.kmeans.fit(all_features)
+                # Set fitted flag
+                self.is_fitted = True
+                # Clear buffer
+                self.feature_buffer = []
+                print("K-means fitted successfully!")
+        
+        # If k-means is fitted, predict clusters
+        if self.is_fitted:
+            # Predict cluster for each patch
+            clusters = self.kmeans.predict(features_for_clustering)
+            
+            # Reshape to 2D grid
+            num_patches = features_for_clustering.shape[0]
+            h = int(math.sqrt(num_patches))
+            w = int(math.ceil(num_patches / h))
+            
+            # Create a padded array if needed
+            if h * w > num_patches:
+                segmentation_map = np.zeros((h, w), dtype=np.int32)
+                for i in range(num_patches):
+                    row = i // w
+                    col = i % w
+                    segmentation_map[row, col] = clusters[i]
+            else:
+                segmentation_map = clusters.reshape(h, w)
+            
+            # Resize to original image size
+            segmentation_map = cv2.resize(
+                segmentation_map.astype(np.float32), 
+                (518, 518), 
+                interpolation=cv2.INTER_NEAREST
+            )
+            
+            # Create colored segmentation map
+            colored_segmentation = np.zeros((518, 518, 3), dtype=np.float32)
+            
+            for cluster_idx in range(self.num_clusters):
+                # Get color for this cluster
+                color = np.array(self.color_map(cluster_idx)[:3])
+                # Apply color to all pixels in this cluster
+                colored_segmentation[segmentation_map == cluster_idx] = color
+                
+            return colored_segmentation
+        else:
+            # Return random colored noise until k-means is fitted
+            print(f"Collecting features for k-means ({len(self.feature_buffer)}/{self.buffer_size})...")
+            noise = np.random.rand(518, 518, 3)
+            return noise
+
 def main():
     """
-    Main function to run real-time feature extraction with Meta's DINOv2 on webcam feed,
-    visualize feature activations, and save the processed video to a file
+    Main function to run real-time DINOv2 depth estimation and semantic segmentation
+    on webcam feed, and save the processed video to a file
     """
-    # Step 1: Load the pre-trained DINOv2 model
-    print("Loading pre-trained DINOv2 model...")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Create DINOv2 feature extractor
+    feature_extractor = DINOv2FeatureExtractor(model_name='dinov2_vits14')
     
-    # For older PyTorch versions, suppress warnings
-    warnings.filterwarnings("ignore", message=".*xFormers.*")
+    # Create depth estimator
+    depth_estimator = DINOv2DepthEstimator(feature_extractor)
     
-    try:
-        # Try loading the small model variant which is more compatible
-        print("Loading DINOv2 ViT-S/14 model...")
-        dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-        patch_size = 14  # Default for ViT-S/14
-        dinov2 = dinov2.to(device)
-        dinov2.eval()  # Set the model to evaluation mode
-    except Exception as e:
-        print(f"Error loading DINOv2 model: {e}")
-        print("Trying DINOv2 ViT-B/14 model...")
-        try:
-            dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
-            patch_size = 14  # Default for ViT-B/14
-            dinov2 = dinov2.to(device)
-            dinov2.eval()
-        except Exception as e:
-            print(f"Error loading alternative model: {e}")
-            print("Using torchvision's ViT model as fallback...")
-            from torchvision.models import vit_b_16, ViT_B_16_Weights
-            dinov2 = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
-            patch_size = 16  # Default for ViT-B/16
-            dinov2 = dinov2.to(device)
-            dinov2.eval()
+    # Create semantic segmenter
+    segmenter = DINOv2SemanticSegmenter(feature_extractor, num_clusters=8)
     
-    # Step 2: Initialize webcam
+    # Initialize webcam
     print("Initializing webcam...")
-    cap = cv2.VideoCapture(0)  # Use 0 for default camera, change if needed
+    cap = cv2.VideoCapture(0)  # Use 0 for default camera
     
     if not cap.isOpened():
         print("Error: Could not open webcam.")
@@ -93,7 +313,7 @@ def main():
     
     # Generate output filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = os.path.join(output_dir, f"dinov2_features_{timestamp}.mp4")
+    output_filename = os.path.join(output_dir, f"dinov2_perception_{timestamp}.mp4")
     
     # Initialize video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4 format
@@ -106,246 +326,140 @@ def main():
     
     print(f"Recording video to: {output_filename}")
     
-    # Define transform for DINOv2
-    transform = T.Compose([
-        T.Resize(224),  # Resize to match ViT input size
-        T.CenterCrop(224),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    
-    # For saliency map generation
-    transform_raw = T.Compose([
-        T.Resize(224),
-        T.CenterCrop(224),
-        T.ToTensor(),
-    ])
-    
-    # Keep track of visualization mode
+    # Define visualization modes
     VIZ_MODES = {
-        0: "FEATURE_MAP",
-        1: "ATTENTION",
-        2: "SALIENCY"
+        0: "DEPTH",
+        1: "SEGMENTATION",
+        2: "SIDE_BY_SIDE"
     }
     current_viz_mode = 0
     
-    def create_simple_saliency_map(model, img_tensor):
-        """Generate a simple gradient-based saliency map"""
-        img_tensor.requires_grad_(True)
-        
-        try:
-            with torch.enable_grad():
-                # Forward pass
-                outputs = model(img_tensor.unsqueeze(0))
-                
-                if isinstance(outputs, dict):
-                    outputs = outputs['logits'] if 'logits' in outputs else list(outputs.values())[0]
-                    
-                # Get predicted class
-                pred_class = outputs.argmax(dim=1)
-                
-                # Backprop to input
-                model.zero_grad()
-                outputs[0, pred_class].backward()
-                
-                # Get gradients
-                gradients = img_tensor.grad.abs()
-                
-                # Max over channels
-                saliency, _ = torch.max(gradients, dim=0)
-                
-                # To numpy
-                return saliency.detach().cpu().numpy()
-                
-        except Exception as e:
-            print(f"Error creating saliency map: {e}")
-            # Return a random saliency map
-            return np.random.rand(224, 224)
+    # Generate colormaps for depth visualization
+    depth_colormaps = [cv2.COLORMAP_INFERNO, cv2.COLORMAP_JET, cv2.COLORMAP_TURBO, cv2.COLORMAP_VIRIDIS]
+    depth_colormap_names = ["Inferno", "Jet", "Turbo", "Viridis"]
+    current_depth_colormap = 0
     
-    # Alternative feature visualization approach
-    def extract_features_and_attentions(img_tensor, img_raw=None, mode="FEATURE_MAP"):
-        try:
-            # Return different visualizations based on mode
-            if mode == "SALIENCY" and img_raw is not None:
-                # Simple saliency map
-                saliency = create_simple_saliency_map(dinov2, img_raw)
-                return np.expand_dims(saliency, 0)
-                
-            # Get features for other modes
-            with torch.no_grad():
-                # Different strategies for feature extraction
-                if hasattr(dinov2, 'get_intermediate_layers'):
-                    # DINOv2 method
-                    features = dinov2.get_intermediate_layers(img_tensor.unsqueeze(0), n=1)[0]
-                elif hasattr(dinov2, 'forward_features'):
-                    # Standard ViT forward_features approach
-                    features = dinov2.forward_features(img_tensor.unsqueeze(0))
-                    # Extract relevant tensor based on type
-                    if isinstance(features, dict):
-                        if 'last_hidden_state' in features:
-                            features = features['last_hidden_state']
-                        elif 'x' in features:
-                            features = features['x']
-                        else:
-                            # Take the first value if keys are unknown
-                            features = list(features.values())[0]
-                else:
-                    # Last resort: just run the model and use its output
-                    features = dinov2(img_tensor.unsqueeze(0))
-                    if isinstance(features, dict):
-                        features = list(features.values())[0]
-                
-                # At this point, features should be a tensor we can work with
-                
-                # For attention map visualization
-                if mode == "ATTENTION":
-                    # If features have CLS token, use it to get attention
-                    if features.dim() == 3 and features.shape[1] > 1:
-                        cls_token = features[:, 0:1]
-                        patch_tokens = features[:, 1:]
-                        
-                        # Calculate similarity as a form of attention
-                        attn = torch.matmul(cls_token, patch_tokens.transpose(1, 2))
-                        attn = torch.nn.functional.softmax(attn, dim=-1)
-                        
-                        # Get the attention map
-                        attn_map = attn[0, 0].cpu().numpy()
-                        
-                        # Try to reshape attention to approximate spatial dimensions
-                        n_patches = attn_map.shape[0]
-                        h = w = int(math.sqrt(n_patches))
-                        
-                        if h * w == n_patches:  # Perfect square
-                            attn_2d = attn_map.reshape(h, w)
-                        else:
-                            # Pad to next perfect square if needed
-                            next_square = (h + 1) ** 2
-                            padded = np.zeros(next_square)
-                            padded[:n_patches] = attn_map
-                            attn_2d = padded.reshape(h + 1, h + 1)
-                            
-                        return np.expand_dims(attn_2d, 0)
-                
-                # Default mode: Feature map
-                # Average over feature dimension
-                if features.dim() > 2:
-                    feature_map = features.mean(dim=-1)
-                else:
-                    feature_map = features
-                
-                # Create a 2D feature map based on model architecture
-                if feature_map.dim() == 2:  # [B, N]
-                    # Skip CLS token if present (first token)
-                    if feature_map.shape[1] > 1:
-                        patches = feature_map[:, 1:] if feature_map.shape[1] > 1 else feature_map
-                    else:
-                        patches = feature_map
-                    
-                    # Convert to numpy
-                    patches_np = patches.cpu().numpy()[0]
-                    
-                    # Get number of patches
-                    n_patches = patches_np.shape[0]
-                    
-                    # Calculate grid dimensions based on patch count
-                    # For a 224x224 image with patch_size=14, we get 16x16=256 patches
-                    # For a 224x224 image with patch_size=16, we get 14x14=196 patches
-                    grid_size = int(math.sqrt(n_patches))
-                    
-                    # If perfect square, reshape directly
-                    if grid_size * grid_size == n_patches:
-                        feature_map_2d = patches_np.reshape(grid_size, grid_size)
-                    else:
-                        # Otherwise, create a grid with the right aspect ratio
-                        # and place the features into it
-                        feature_map_2d = np.zeros((grid_size + 1, grid_size + 1))
-                        for i in range(min(n_patches, (grid_size + 1) * (grid_size + 1))):
-                            row = i // (grid_size + 1)
-                            col = i % (grid_size + 1)
-                            feature_map_2d[row, col] = patches_np[i]
-                    
-                    return np.expand_dims(feature_map_2d, 0)
-                else:
-                    # Already in spatial format
-                    return feature_map.cpu().numpy()
-                    
-        except Exception as e:
-            print(f"Error extracting features: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return a fallback feature map (random noise)
-            return np.random.rand(1, 16, 16)
-    
-    print("Starting real-time DINOv2 feature extraction and recording. Press 'q' to quit.")
-    print("Press 'v' to cycle through visualization modes (Feature Map, Attention, Saliency)")
-    print("Press 'c' to cycle through colormaps")
+    print("Starting real-time DINOv2 perception. Press 'q' to quit.")
+    print("Press 'v' to cycle through visualization modes (Depth, Segmentation, Side-by-Side)")
+    print("Press 'c' to cycle through depth colormaps")
     
     frame_count = 0
     recording_start_time = time.time()
     
-    # Generate different color maps for visualization variety
-    colormaps = [cv2.COLORMAP_JET, cv2.COLORMAP_VIRIDIS, cv2.COLORMAP_TURBO, cv2.COLORMAP_INFERNO]
-    colormap_names = ["Jet", "Viridis", "Turbo", "Inferno"]
-    current_colormap = 0
-    
-    # For logging - don't spam console with the same error
-    last_error = None
-    error_count = 0
+    # For performance tracking
+    processing_times = []
     
     try:
         while True:
             start_time = time.time()
             
-            # Step 3: Capture frame from webcam
+            # Capture frame from webcam
             ret, frame = cap.read()
             if not ret:
                 print("Error: Failed to capture image")
                 break
             
             # Create a copy of the frame for saving
-            frame_with_features = frame.copy()
+            frame_with_viz = frame.copy()
             
-            # Step 4: Transform the image for the model
-            # Convert BGR to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_frame)
+            # Convert to PIL Image for processing
+            pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             
-            # Create normalized input for the model
-            img_tensor = transform(pil_image).to(device)
+            # Process the frame depending on the current visualization mode
+            depth_map = None
+            segmentation_map = None
             
-            # Create raw input for saliency map if needed
-            img_raw = None
-            if current_viz_mode == 2:  # Saliency mode
-                img_raw = transform_raw(pil_image).to(device)
+            # Always process for the side-by-side view, or if in respective single mode
+            if current_viz_mode in [0, 2]:  # DEPTH or SIDE_BY_SIDE
+                # Estimate depth
+                try:
+                    depth_map = depth_estimator.estimate_depth(pil_image)
+                    
+                    # Convert depth map to colored visualization
+                    colored_depth = cv2.applyColorMap(
+                        (depth_map * 255).astype(np.uint8), 
+                        depth_colormaps[current_depth_colormap]
+                    )
+                    
+                    # Resize to match frame size
+                    colored_depth = cv2.resize(colored_depth, (frame_width, frame_height))
+                except Exception as e:
+                    print(f"Error estimating depth: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Create a blank depth map on error
+                    colored_depth = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+                    cv2.putText(
+                        colored_depth,
+                        "Depth estimation error",
+                        (frame_width // 4, frame_height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 0, 255),
+                        2
+                    )
             
-            # Step 5: Extract features based on current visualization mode
-            feature_map = extract_features_and_attentions(
-                img_tensor, img_raw, mode=VIZ_MODES[current_viz_mode]
-            )
+            if current_viz_mode in [1, 2]:  # SEGMENTATION or SIDE_BY_SIDE
+                # Perform semantic segmentation
+                try:
+                    segmentation_map = segmenter.segment_image(pil_image)
+                    
+                    # Convert to uint8 for display and resize to match frame size
+                    colored_segmentation = (segmentation_map * 255).astype(np.uint8)
+                    colored_segmentation = cv2.resize(
+                        colored_segmentation, 
+                        (frame_width, frame_height)
+                    )
+                except Exception as e:
+                    print(f"Error performing segmentation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Create a blank segmentation map on error
+                    colored_segmentation = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+                    cv2.putText(
+                        colored_segmentation,
+                        "Segmentation error",
+                        (frame_width // 4, frame_height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 0, 255),
+                        2
+                    )
             
-            # Resize feature map to match video frame using OpenCV
-            resized_features = cv2.resize(
-                feature_map[0], (frame_width, frame_height), 
-                interpolation=cv2.INTER_LINEAR
-            )
-            
-            # Normalize feature map for visualization
-            feature_min, feature_max = resized_features.min(), resized_features.max()
-            normalized_features = (resized_features - feature_min) / (feature_max - feature_min + 1e-8)
-            
-            # Apply Gaussian blur to make visualization smoother
-            normalized_features = cv2.GaussianBlur(normalized_features, (5, 5), 0)
-            
-            # Convert to heatmap using current colormap
-            colormap = colormaps[current_colormap]
-            heatmap = cv2.applyColorMap((normalized_features * 255).astype(np.uint8), colormap)
-            
-            # Overlay heatmap on original frame
-            alpha = 0.7  # Transparency factor
-            frame_with_features = cv2.addWeighted(frame_with_features, 1-alpha, heatmap, alpha, 0)
+            # Combine visualizations based on current mode
+            if current_viz_mode == 0:  # DEPTH
+                # Apply depth map as overlay
+                alpha = 0.7
+                frame_with_viz = cv2.addWeighted(
+                    frame_with_viz, 1-alpha, colored_depth, alpha, 0
+                )
+            elif current_viz_mode == 1:  # SEGMENTATION
+                # Apply segmentation map as overlay
+                alpha = 0.7
+                frame_with_viz = cv2.addWeighted(
+                    frame_with_viz, 1-alpha, colored_segmentation, alpha, 0
+                )
+            elif current_viz_mode == 2:  # SIDE_BY_SIDE
+                # Create side by side display: [Original | Depth | Segmentation]
+                vis_width = frame_width // 3
+                
+                # Resize the original frame and visualization maps to fit side by side
+                original_resized = cv2.resize(frame, (vis_width, frame_height))
+                depth_resized = cv2.resize(colored_depth, (vis_width, frame_height))
+                segmentation_resized = cv2.resize(colored_segmentation, (vis_width, frame_height))
+                
+                # Combine horizontally
+                frame_with_viz = np.hstack((original_resized, depth_resized, segmentation_resized))
             
             # Calculate and display FPS
-            processing_fps = 1.0 / max(0.001, time.time() - start_time)  # Prevent division by zero
+            processing_time = time.time() - start_time
+            processing_times.append(processing_time)
+            if len(processing_times) > 30:  # Keep only recent frames for FPS calculation
+                processing_times.pop(0)
+            
+            # Calculate average FPS
+            avg_processing_time = sum(processing_times) / len(processing_times)
+            processing_fps = 1.0 / max(0.001, avg_processing_time)
             
             # Add recording indicator and FPS
             elapsed_time = time.time() - recording_start_time
@@ -353,66 +467,125 @@ def main():
             hours, minutes = divmod(minutes, 60)
             time_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             
-            # Display recording time
-            cv2.putText(
-                frame_with_features,
-                f"REC {time_text}",
-                (frame_width - 180, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 0, 255),  # Red color
-                2
-            )
-            
-            # Display FPS
-            cv2.putText(
-                frame_with_features,
-                f"FPS: {processing_fps:.1f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 0, 255),  # Red color
-                2
-            )
-            
-            # Display model name and visualization mode
-            cv2.putText(
-                frame_with_features,
-                f"DINOv2 - Mode: {VIZ_MODES[current_viz_mode]}",
-                (10, frame_height - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),  # White color
-                2
-            )
-            
-            # Display colormap name 
-            cv2.putText(
-                frame_with_features,
-                f"Colormap: {colormap_names[current_colormap]} (Press 'c' to change)",
-                (10, frame_height - 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (200, 200, 200),  # Light gray
-                1
-            )
-            
-            # Display controls
-            cv2.putText(
-                frame_with_features,
-                "Controls: 'v' - change viz mode, 'q' - quit",
-                (10, frame_height - 70),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (200, 200, 200),  # Light gray
-                1
-            )
+            # Skip overlay text for side-by-side view
+            if current_viz_mode != 2:
+                # Display recording time 
+                cv2.putText(
+                    frame_with_viz,
+                    f"REC {time_text}",
+                    (frame_width - 180, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),  # Red color
+                    2
+                )
+                
+                # Display FPS
+                cv2.putText(
+                    frame_with_viz,
+                    f"FPS: {processing_fps:.1f}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),  # Red color
+                    2
+                )
+                
+                # Display model name and visualization mode
+                cv2.putText(
+                    frame_with_viz,
+                    f"DINOv2 - Mode: {VIZ_MODES[current_viz_mode]}",
+                    (10, frame_height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),  # White color
+                    2
+                )
+                
+                # Display colormap info for depth visualization
+                if current_viz_mode == 0:
+                    cv2.putText(
+                        frame_with_viz,
+                        f"Colormap: {depth_colormap_names[current_depth_colormap]} (Press 'c' to change)",
+                        (10, frame_height - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),  # Light gray
+                        1
+                    )
+                
+                # Display segmentation info
+                if current_viz_mode == 1:
+                    status_text = "K-means initialized" if segmenter.is_fitted else f"Initializing ({len(segmenter.feature_buffer)}/{segmenter.buffer_size})"
+                    cv2.putText(
+                        frame_with_viz,
+                        f"Segmentation: {status_text}",
+                        (10, frame_height - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),  # Light gray
+                        1
+                    )
+                
+                # Display controls
+                cv2.putText(
+                    frame_with_viz,
+                    "Controls: 'v' - change viz mode, 'c' - change colormap, 'q' - quit",
+                    (10, frame_height - 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (200, 200, 200),  # Light gray
+                    1
+                )
+            else:
+                # For side-by-side view, add labels
+                # Create a header area
+                header_height = 30
+                header = np.zeros((header_height, frame_with_viz.shape[1], 3), dtype=np.uint8)
+                
+                # Add section titles
+                cv2.putText(
+                    header,
+                    "Original",
+                    (vis_width // 2 - 40, header_height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+                
+                cv2.putText(
+                    header,
+                    "Depth",
+                    (vis_width + vis_width // 2 - 30, header_height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+                
+                cv2.putText(
+                    header,
+                    "Segmentation",
+                    (2 * vis_width + vis_width // 2 - 50, header_height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+                
+                # Combine header with visualization
+                frame_with_viz = np.vstack((header, frame_with_viz))
             
             # Write the frame to the output video
-            out.write(frame_with_features)
+            if current_viz_mode == 2:
+                # For side-by-side view, we need to create a version without the header
+                out.write(frame_with_viz[header_height:])
+            else:
+                out.write(frame_with_viz)
             
             # Display the result
-            cv2.imshow('DINOv2 Vision Features', frame_with_features)
+            cv2.imshow('DINOv2 Perception', frame_with_viz)
             
             # Counter for frames processed
             frame_count += 1
@@ -422,11 +595,11 @@ def main():
             if key == ord('q'):
                 break
             elif key == ord('c'):
-                # Change colormap on 'c' key press
-                current_colormap = (current_colormap + 1) % len(colormaps)
-                print(f"Switched to colormap: {colormap_names[current_colormap]}")
+                # Change colormap for depth visualization
+                current_depth_colormap = (current_depth_colormap + 1) % len(depth_colormaps)
+                print(f"Switched to depth colormap: {depth_colormap_names[current_depth_colormap]}")
             elif key == ord('v'):
-                # Change visualization mode on 'v' key press
+                # Change visualization mode
                 current_viz_mode = (current_viz_mode + 1) % len(VIZ_MODES)
                 print(f"Switched to visualization mode: {VIZ_MODES[current_viz_mode]}")
     
@@ -446,7 +619,10 @@ def main():
             # Print summary
             recording_duration = time.time() - recording_start_time
             print(f"Recording completed: {frame_count} frames processed in {recording_duration:.2f} seconds")
-            print(f"Average FPS: {frame_count / recording_duration:.2f}")
+            if frame_count > 0:
+                print(f"Average FPS: {frame_count / recording_duration:.2f}")
+            else:
+                print("Average FPS: 0.00")
             print(f"Video saved to: {output_filename}")
         except Exception as e:
             print(f"Error during cleanup: {e}")
@@ -456,24 +632,26 @@ if __name__ == "__main__":
     try:
         import torch
         import torchvision
+        import sklearn
         print(f"PyTorch version: {torch.__version__}")
         print(f"Torchvision version: {torchvision.__version__}")
+        print(f"scikit-learn version: {sklearn.__version__}")
         print(f"CUDA available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
             print(f"CUDA device: {torch.cuda.get_device_name(0)}")
     except ImportError as e:
         print(f"Missing required packages: {e}")
         print("Please install the required packages using:")
-        print("pip install torch torchvision opencv-python numpy matplotlib pillow")
+        print("pip install torch torchvision opencv-python numpy matplotlib pillow scikit-learn tqdm")
         exit(1)
     
     # Main execution
     try:
-        print("Loading DINOv2 model...")
+        print("Starting DINOv2 perception system...")
         main()
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
         print("\nIf this is the first time running DINOv2, you might need additional dependencies:")
-        print("pip install timm") 
+        print("pip install timm scikit-learn tqdm") 
