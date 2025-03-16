@@ -129,65 +129,76 @@ class DINOv2DepthEstimator:
         if hasattr(feature_extractor.model, 'embed_dim'):
             self.feature_dim = feature_extractor.model.embed_dim
         
-        # Linear regression layer for depth estimation (trained weights would be better)
-        # This is a simple stand-in that should be replaced with a proper model
-        self.depth_regressor = torch.nn.Linear(self.feature_dim, 1).to(self.device)
-        
-        # Initialize with random weights - ideally would load pretrained weights
-        # This will produce noisy but structured depth maps
-        torch.nn.init.normal_(self.depth_regressor.weight, std=0.01)
+        # For a more meaningful depth estimation, we'll use PCA instead of random weights
+        # PCA will find the principal components of variation in the feature space
+        # This often correlates with depth in natural images
+        self.pca = PCA(n_components=1)
+        self.is_fitted = False
+        self.feature_buffer = []
+        self.buffer_size = 5  # Collect features from this many frames before fitting PCA
         
     def estimate_depth(self, image):
         """Estimate depth from an image using DINOv2 features"""
         # Get patch features from the image
         patch_features = self.feature_extractor.extract_patch_features(image)
         
-        # Apply the depth regressor to estimate depth values
+        # Extract feature vectors
         with torch.no_grad():
-            # Print debug info
+            # Get feature shape
             batch_size, num_patches, feature_dim = patch_features.shape
-            print(f"Patch features shape: [{batch_size}, {num_patches}, {feature_dim}]")
+            features_for_pca = patch_features.squeeze(0).cpu().numpy()
             
-            # Apply depth regression
-            depth_values = self.depth_regressor(patch_features)
+            # If PCA not fitted yet, collect features
+            if not self.is_fitted:
+                self.feature_buffer.append(features_for_pca)
+                if len(self.feature_buffer) >= self.buffer_size:
+                    print("Fitting PCA for depth estimation...")
+                    # Concatenate all features
+                    all_features = np.vstack(self.feature_buffer)
+                    # Fit PCA
+                    self.pca.fit(all_features)
+                    self.is_fitted = True
+                    self.feature_buffer = []
+                    print("PCA fitted successfully!")
             
-            # Calculate dimensions for reshaping
-            # For non-square patch grids, we need to find the closest factors
-            # that will accommodate all our patches
+            # Apply PCA to get depth values (or use a placeholder if not fitted)
+            if self.is_fitted:
+                # Transform features to get primary component
+                depth_values = self.pca.transform(features_for_pca)
+            else:
+                # Use placeholder values based on feature norms until PCA is fitted
+                print(f"Collecting features for PCA ({len(self.feature_buffer)}/{self.buffer_size})...")
+                # Feature vector magnitudes can give rough depth estimate
+                depth_values = np.linalg.norm(features_for_pca, axis=1, keepdims=True)
+            
+            # Reshape depth values to 2D grid
             h = int(math.sqrt(num_patches))
-            
-            # Find the best width given the height to fit all patches
             w = int(math.ceil(num_patches / h))
             
-            print(f"Reshaping depth values to: [{batch_size}, {h}, {w}]")
-            
-            # Reshape to 2D grid, possibly with padding
-            # First flatten the depth values
-            depth_values_flat = depth_values.reshape(batch_size, -1)
-            
-            # Create a padded tensor if needed
+            # Create depth map
             if h * w > num_patches:
-                # Pad with zeros to make it fit the h*w shape
-                padded_depth = torch.zeros(batch_size, h * w, device=self.device)
-                padded_depth[:, :num_patches] = depth_values_flat
-                depth_map = padded_depth.view(batch_size, h, w)
+                # Pad with zeros if needed
+                depth_map = np.zeros((h, w))
+                for i in range(num_patches):
+                    row = i // w
+                    col = i % w
+                    depth_map[row, col] = depth_values[i]
             else:
-                # If no padding is needed (perfect square)
-                depth_map = depth_values_flat.view(batch_size, h, w)
+                depth_map = depth_values.reshape(h, w)
             
-            # Apply basic post-processing
-            depth_map = F.interpolate(
-                depth_map.unsqueeze(1), 
-                size=(518, 518), 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(1)
+            # Resize to match display size
+            depth_map = cv2.resize(depth_map, (518, 518), interpolation=cv2.INTER_LINEAR)
             
-            # Normalize depth values to 0-1 range for visualization
-            normalized_depth = depth_map - depth_map.min()
-            normalized_depth = normalized_depth / (normalized_depth.max() + 1e-8)
+            # Apply smoothing for better visualization
+            depth_map = cv2.GaussianBlur(depth_map, (5, 5), 0)
             
-            return normalized_depth.cpu().numpy()[0]
+            # Normalize depth map for visualization
+            depth_map = depth_map - depth_map.min()
+            max_val = depth_map.max()
+            if max_val > 0:
+                depth_map = depth_map / max_val
+            
+            return depth_map
 
 # Semantic segmentation model based on DINOv2 features
 class DINOv2SemanticSegmenter:
@@ -197,8 +208,7 @@ class DINOv2SemanticSegmenter:
         self.device = feature_extractor.device
         self.num_clusters = num_clusters
         
-        # We'll use simple k-means for clustering features
-        # In production, one would use a learned clustering/segmentation head
+        # We'll use k-means for clustering features
         from sklearn.cluster import KMeans
         self.kmeans = KMeans(n_clusters=num_clusters, n_init=10)
         
@@ -209,8 +219,13 @@ class DINOv2SemanticSegmenter:
         self.feature_buffer = []
         self.buffer_size = 10
         
-        # Color map for visualization
-        self.color_map = plt.cm.get_cmap('tab10', num_clusters)
+        # Color map for visualization - using a more distinct colormap
+        self.color_map = plt.cm.get_cmap('viridis', num_clusters)
+        
+        # For dimensionality reduction before clustering
+        # This makes clustering more effective and faster
+        self.pca = PCA(n_components=50)  # Reduce to 50 dimensions
+        self.pca_fitted = False
         
     def segment_image(self, image):
         """Perform semantic segmentation using DINOv2 features and k-means clustering"""
@@ -218,65 +233,188 @@ class DINOv2SemanticSegmenter:
         patch_features = self.feature_extractor.extract_patch_features(image)
         
         # Get features for clustering
-        features_for_clustering = patch_features.squeeze(0).cpu().numpy()
+        features = patch_features.squeeze(0).cpu().numpy()
         
-        # If k-means isn't fitted yet, collect features
-        if not self.is_fitted:
-            self.feature_buffer.append(features_for_clustering)
+        # Apply feature normalization - important for better clustering
+        # L2 normalize each feature vector
+        feature_norms = np.linalg.norm(features, axis=1, keepdims=True)
+        features_normalized = features / (feature_norms + 1e-8)  # avoid division by zero
+        
+        # Dimensionality reduction with PCA if we have enough data
+        if not self.pca_fitted:
+            self.feature_buffer.append(features_normalized)
             if len(self.feature_buffer) >= self.buffer_size:
-                print("Fitting k-means for semantic segmentation...")
-                # Concatenate all features
+                print("Fitting PCA for feature dimensionality reduction...")
                 all_features = np.vstack(self.feature_buffer)
-                # Fit k-means on collected features
-                self.kmeans.fit(all_features)
-                # Set fitted flag
+                self.pca.fit(all_features)
+                self.pca_fitted = True
+                # Now fit k-means on reduced features
+                reduced_features = self.pca.transform(all_features)
+                print("Fitting k-means on reduced features...")
+                self.kmeans.fit(reduced_features)
                 self.is_fitted = True
-                # Clear buffer
                 self.feature_buffer = []
-                print("K-means fitted successfully!")
+                print("Feature preprocessing and k-means initialization complete!")
         
-        # If k-means is fitted, predict clusters
-        if self.is_fitted:
-            # Predict cluster for each patch
-            clusters = self.kmeans.predict(features_for_clustering)
+        # If PCA is fitted, apply dimensionality reduction
+        if self.pca_fitted:
+            features_for_clustering = self.pca.transform(features_normalized)
             
-            # Reshape to 2D grid
-            num_patches = features_for_clustering.shape[0]
+            # If k-means is fitted, predict clusters
+            if self.is_fitted:
+                # Predict cluster for each patch
+                clusters = self.kmeans.predict(features_for_clustering)
+                
+                # Reshape to 2D grid
+                num_patches = features.shape[0]
+                h = int(math.sqrt(num_patches))
+                w = int(math.ceil(num_patches / h))
+                
+                # Create a padded array if needed
+                if h * w > num_patches:
+                    segmentation_map = np.zeros((h, w), dtype=np.int32)
+                    for i in range(num_patches):
+                        row = i // w
+                        col = i % w
+                        segmentation_map[row, col] = clusters[i]
+                else:
+                    segmentation_map = clusters.reshape(h, w)
+                
+                # Apply median filtering to remove noise
+                segmentation_map = cv2.medianBlur(segmentation_map.astype(np.uint8), 3)
+                
+                # Resize to original image size
+                segmentation_map = cv2.resize(
+                    segmentation_map.astype(np.float32), 
+                    (518, 518), 
+                    interpolation=cv2.INTER_NEAREST
+                )
+                
+                # Create colored segmentation map
+                colored_segmentation = np.zeros((518, 518, 3), dtype=np.float32)
+                
+                for cluster_idx in range(self.num_clusters):
+                    # Get color for this cluster
+                    color = np.array(self.color_map(cluster_idx)[:3])
+                    # Apply color to all pixels in this cluster
+                    colored_segmentation[segmentation_map == cluster_idx] = color
+                
+                return colored_segmentation
+        
+        # Return a placeholder during initialization
+        print(f"Collecting features for segmentation ({len(self.feature_buffer)}/{self.buffer_size})...")
+        placeholder = np.zeros((518, 518, 3), dtype=np.float32)
+        
+        # Generate a nicer placeholder visualization
+        h, w = 518, 518
+        for i in range(10):
+            y1, x1 = np.random.randint(0, h), np.random.randint(0, w)
+            y2, x2 = np.random.randint(0, h), np.random.randint(0, w)
+            color = np.random.rand(3)
+            cv2.line(placeholder, (x1, y1), (x2, y2), color, 2)
+        
+        cv2.putText(
+            placeholder,
+            "Initializing segmentation...",
+            (100, 250),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (1, 1, 1),
+            2
+        )
+        
+        return placeholder
+
+# Feature visualization based on DINOv2 features
+class DINOv2FeatureVisualizer:
+    def __init__(self, feature_extractor):
+        """Initialize feature visualizer with a DINOv2 feature extractor"""
+        self.feature_extractor = feature_extractor
+        self.device = feature_extractor.device
+        
+        # For dimensionality reduction (will project high-dimensional features to 3D for RGB visualization)
+        self.pca = PCA(n_components=3)
+        self.is_fitted = False
+        self.feature_buffer = []
+        self.buffer_size = 5
+    
+    def visualize_features(self, image):
+        """Create RGB visualization of DINOv2 features using PCA"""
+        # Get patch features
+        patch_features = self.feature_extractor.extract_patch_features(image)
+        
+        # Move to numpy for processing
+        features = patch_features.squeeze(0).cpu().numpy()
+        
+        # Normalize features (important for better visualization)
+        feature_norms = np.linalg.norm(features, axis=1, keepdims=True)
+        features_normalized = features / (feature_norms + 1e-8)
+        
+        # If PCA not fitted yet, collect features
+        if not self.is_fitted:
+            self.feature_buffer.append(features_normalized)
+            if len(self.feature_buffer) >= self.buffer_size:
+                print("Fitting PCA for feature visualization...")
+                all_features = np.vstack(self.feature_buffer)
+                self.pca.fit(all_features)
+                self.is_fitted = True
+                self.feature_buffer = []
+                print("PCA fitted successfully for feature visualization!")
+        
+        # Project features to 3D space for RGB visualization
+        if self.is_fitted:
+            rgb_features = self.pca.transform(features_normalized)
+            
+            # Scale to [0, 1] range for RGB
+            rgb_features = rgb_features - rgb_features.min(axis=0)
+            rgb_features = rgb_features / (rgb_features.max(axis=0) + 1e-8)
+            
+            # Reshape to 2D spatial grid
+            num_patches = features.shape[0]
             h = int(math.sqrt(num_patches))
             w = int(math.ceil(num_patches / h))
             
-            # Create a padded array if needed
+            # Create feature map
             if h * w > num_patches:
-                segmentation_map = np.zeros((h, w), dtype=np.int32)
+                feature_map = np.zeros((h, w, 3))
                 for i in range(num_patches):
                     row = i // w
                     col = i % w
-                    segmentation_map[row, col] = clusters[i]
+                    feature_map[row, col] = rgb_features[i]
             else:
-                segmentation_map = clusters.reshape(h, w)
+                feature_map = rgb_features.reshape(h, w, 3)
             
-            # Resize to original image size
-            segmentation_map = cv2.resize(
-                segmentation_map.astype(np.float32), 
-                (518, 518), 
-                interpolation=cv2.INTER_NEAREST
+            # Resize to display size
+            feature_map = cv2.resize(feature_map, (518, 518), interpolation=cv2.INTER_LINEAR)
+            
+            # Apply light Gaussian blur for smoother visualization
+            feature_map = cv2.GaussianBlur(feature_map, (3, 3), 0)
+            
+            return feature_map
+        else:
+            # Return a placeholder during initialization
+            print(f"Collecting features for visualization ({len(self.feature_buffer)}/{self.buffer_size})...")
+            
+            # Create a more informative placeholder
+            placeholder = np.zeros((518, 518, 3), dtype=np.float32)
+            
+            # Add a gradient background
+            y, x = np.mgrid[0:518, 0:518]
+            placeholder[:,:,0] = x / 518.0
+            placeholder[:,:,1] = y / 518.0
+            placeholder[:,:,2] = 0.5
+            
+            cv2.putText(
+                placeholder,
+                "Initializing feature visualization...",
+                (50, 250),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (1, 1, 1),
+                2
             )
             
-            # Create colored segmentation map
-            colored_segmentation = np.zeros((518, 518, 3), dtype=np.float32)
-            
-            for cluster_idx in range(self.num_clusters):
-                # Get color for this cluster
-                color = np.array(self.color_map(cluster_idx)[:3])
-                # Apply color to all pixels in this cluster
-                colored_segmentation[segmentation_map == cluster_idx] = color
-                
-            return colored_segmentation
-        else:
-            # Return random colored noise until k-means is fitted
-            print(f"Collecting features for k-means ({len(self.feature_buffer)}/{self.buffer_size})...")
-            noise = np.random.rand(518, 518, 3)
-            return noise
+            return placeholder
 
 def main():
     """
@@ -291,6 +429,9 @@ def main():
     
     # Create semantic segmenter
     segmenter = DINOv2SemanticSegmenter(feature_extractor, num_clusters=8)
+    
+    # Create feature visualizer
+    feature_visualizer = DINOv2FeatureVisualizer(feature_extractor)
     
     # Initialize webcam
     print("Initializing webcam...")
@@ -330,7 +471,8 @@ def main():
     VIZ_MODES = {
         0: "DEPTH",
         1: "SEGMENTATION",
-        2: "SIDE_BY_SIDE"
+        2: "FEATURES",
+        3: "SIDE_BY_SIDE"
     }
     current_viz_mode = 0
     
@@ -340,7 +482,7 @@ def main():
     current_depth_colormap = 0
     
     print("Starting real-time DINOv2 perception. Press 'q' to quit.")
-    print("Press 'v' to cycle through visualization modes (Depth, Segmentation, Side-by-Side)")
+    print("Press 'v' to cycle through visualization modes (Depth, Segmentation, Features, Side-by-Side)")
     print("Press 'c' to cycle through depth colormaps")
     
     frame_count = 0
@@ -368,9 +510,10 @@ def main():
             # Process the frame depending on the current visualization mode
             depth_map = None
             segmentation_map = None
+            feature_map = None
             
             # Always process for the side-by-side view, or if in respective single mode
-            if current_viz_mode in [0, 2]:  # DEPTH or SIDE_BY_SIDE
+            if current_viz_mode in [0, 3]:  # DEPTH or SIDE_BY_SIDE
                 # Estimate depth
                 try:
                     depth_map = depth_estimator.estimate_depth(pil_image)
@@ -399,7 +542,7 @@ def main():
                         2
                     )
             
-            if current_viz_mode in [1, 2]:  # SEGMENTATION or SIDE_BY_SIDE
+            if current_viz_mode in [1, 3]:  # SEGMENTATION or SIDE_BY_SIDE
                 # Perform semantic segmentation
                 try:
                     segmentation_map = segmenter.segment_image(pil_image)
@@ -426,6 +569,33 @@ def main():
                         2
                     )
             
+            if current_viz_mode in [2, 3]:  # FEATURES or SIDE_BY_SIDE
+                # Visualize features
+                try:
+                    feature_map = feature_visualizer.visualize_features(pil_image)
+                    
+                    # Convert to uint8 for display and resize to match frame size
+                    colored_features = (feature_map * 255).astype(np.uint8)
+                    colored_features = cv2.resize(
+                        colored_features, 
+                        (frame_width, frame_height)
+                    )
+                except Exception as e:
+                    print(f"Error visualizing features: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Create a blank feature map on error
+                    colored_features = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+                    cv2.putText(
+                        colored_features,
+                        "Feature visualization error",
+                        (frame_width // 4, frame_height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 0, 255),
+                        2
+                    )
+            
             # Combine visualizations based on current mode
             if current_viz_mode == 0:  # DEPTH
                 # Apply depth map as overlay
@@ -439,106 +609,28 @@ def main():
                 frame_with_viz = cv2.addWeighted(
                     frame_with_viz, 1-alpha, colored_segmentation, alpha, 0
                 )
-            elif current_viz_mode == 2:  # SIDE_BY_SIDE
-                # Create side by side display: [Original | Depth | Segmentation]
-                vis_width = frame_width // 3
+            elif current_viz_mode == 2:  # FEATURES
+                # Apply feature map as overlay
+                alpha = 0.7
+                frame_with_viz = cv2.addWeighted(
+                    frame_with_viz, 1-alpha, colored_features, alpha, 0
+                )
+            elif current_viz_mode == 3:  # SIDE_BY_SIDE
+                # Create side by side display: [Original | Depth | Segmentation | Features]
+                vis_width = frame_width // 4
+                
+                # Calculate appropriate height to maintain aspect ratio
+                vis_height = int(frame_height * (vis_width / frame_width))
                 
                 # Resize the original frame and visualization maps to fit side by side
-                original_resized = cv2.resize(frame, (vis_width, frame_height))
-                depth_resized = cv2.resize(colored_depth, (vis_width, frame_height))
-                segmentation_resized = cv2.resize(colored_segmentation, (vis_width, frame_height))
+                original_resized = cv2.resize(frame, (vis_width, vis_height))
+                depth_resized = cv2.resize(colored_depth, (vis_width, vis_height))
+                segmentation_resized = cv2.resize(colored_segmentation, (vis_width, vis_height))
+                features_resized = cv2.resize(colored_features, (vis_width, vis_height))
                 
                 # Combine horizontally
-                frame_with_viz = np.hstack((original_resized, depth_resized, segmentation_resized))
-            
-            # Calculate and display FPS
-            processing_time = time.time() - start_time
-            processing_times.append(processing_time)
-            if len(processing_times) > 30:  # Keep only recent frames for FPS calculation
-                processing_times.pop(0)
-            
-            # Calculate average FPS
-            avg_processing_time = sum(processing_times) / len(processing_times)
-            processing_fps = 1.0 / max(0.001, avg_processing_time)
-            
-            # Add recording indicator and FPS
-            elapsed_time = time.time() - recording_start_time
-            minutes, seconds = divmod(int(elapsed_time), 60)
-            hours, minutes = divmod(minutes, 60)
-            time_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            
-            # Skip overlay text for side-by-side view
-            if current_viz_mode != 2:
-                # Display recording time 
-                cv2.putText(
-                    frame_with_viz,
-                    f"REC {time_text}",
-                    (frame_width - 180, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),  # Red color
-                    2
-                )
+                frame_with_viz = np.hstack((original_resized, depth_resized, segmentation_resized, features_resized))
                 
-                # Display FPS
-                cv2.putText(
-                    frame_with_viz,
-                    f"FPS: {processing_fps:.1f}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),  # Red color
-                    2
-                )
-                
-                # Display model name and visualization mode
-                cv2.putText(
-                    frame_with_viz,
-                    f"DINOv2 - Mode: {VIZ_MODES[current_viz_mode]}",
-                    (10, frame_height - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),  # White color
-                    2
-                )
-                
-                # Display colormap info for depth visualization
-                if current_viz_mode == 0:
-                    cv2.putText(
-                        frame_with_viz,
-                        f"Colormap: {depth_colormap_names[current_depth_colormap]} (Press 'c' to change)",
-                        (10, frame_height - 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (200, 200, 200),  # Light gray
-                        1
-                    )
-                
-                # Display segmentation info
-                if current_viz_mode == 1:
-                    status_text = "K-means initialized" if segmenter.is_fitted else f"Initializing ({len(segmenter.feature_buffer)}/{segmenter.buffer_size})"
-                    cv2.putText(
-                        frame_with_viz,
-                        f"Segmentation: {status_text}",
-                        (10, frame_height - 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (200, 200, 200),  # Light gray
-                        1
-                    )
-                
-                # Display controls
-                cv2.putText(
-                    frame_with_viz,
-                    "Controls: 'v' - change viz mode, 'c' - change colormap, 'q' - quit",
-                    (10, frame_height - 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (200, 200, 200),  # Light gray
-                    1
-                )
-            else:
-                # For side-by-side view, add labels
                 # Create a header area
                 header_height = 30
                 header = np.zeros((header_height, frame_with_viz.shape[1], 3), dtype=np.uint8)
@@ -574,13 +666,136 @@ def main():
                     1
                 )
                 
+                cv2.putText(
+                    header,
+                    "Features",
+                    (3 * vis_width + vis_width // 2 - 40, header_height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+                
                 # Combine header with visualization
                 frame_with_viz = np.vstack((header, frame_with_viz))
             
+            # Calculate and display FPS
+            processing_time = time.time() - start_time
+            processing_times.append(processing_time)
+            if len(processing_times) > 30:  # Keep only recent frames for FPS calculation
+                processing_times.pop(0)
+            
+            # Calculate average FPS
+            avg_processing_time = sum(processing_times) / len(processing_times)
+            processing_fps = 1.0 / max(0.001, avg_processing_time)
+            
+            # Add recording indicator and FPS
+            elapsed_time = time.time() - recording_start_time
+            minutes, seconds = divmod(int(elapsed_time), 60)
+            hours, minutes = divmod(minutes, 60)
+            time_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            
+            # Skip overlay text for side-by-side view
+            if current_viz_mode != 3:
+                # Display recording time 
+                cv2.putText(
+                    frame_with_viz,
+                    f"REC {time_text}",
+                    (frame_width - 180, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),  # Red color
+                    2
+                )
+                
+                # Display FPS
+                cv2.putText(
+                    frame_with_viz,
+                    f"FPS: {processing_fps:.1f}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),  # Red color
+                    2
+                )
+                
+                # Display model name and visualization mode
+                cv2.putText(
+                    frame_with_viz,
+                    f"DINOv2 - Mode: {VIZ_MODES[current_viz_mode]}",
+                    (10, frame_height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),  # White color
+                    2
+                )
+                
+                # Display additional info based on current mode
+                if current_viz_mode == 0:  # DEPTH
+                    cv2.putText(
+                        frame_with_viz,
+                        f"Colormap: {depth_colormap_names[current_depth_colormap]} (Press 'c' to change)",
+                        (10, frame_height - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),  # Light gray
+                        1
+                    )
+                    
+                    # Show depth estimation status
+                    status_text = "PCA initialized" if depth_estimator.is_fitted else f"Initializing ({len(depth_estimator.feature_buffer)}/{depth_estimator.buffer_size})"
+                    cv2.putText(
+                        frame_with_viz,
+                        f"Depth estimation: {status_text}",
+                        (10, frame_height - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),
+                        1
+                    )
+                elif current_viz_mode == 1:  # SEGMENTATION
+                    status_text = "Initialized" if segmenter.is_fitted else f"Initializing ({len(segmenter.feature_buffer)}/{segmenter.buffer_size})"
+                    cv2.putText(
+                        frame_with_viz,
+                        f"Segmentation: {status_text}",
+                        (10, frame_height - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),  # Light gray
+                        1
+                    )
+                elif current_viz_mode == 2:  # FEATURES
+                    status_text = "PCA initialized" if feature_visualizer.is_fitted else f"Initializing ({len(feature_visualizer.feature_buffer)}/{feature_visualizer.buffer_size})"
+                    cv2.putText(
+                        frame_with_viz,
+                        f"Feature visualization: {status_text}",
+                        (10, frame_height - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),  # Light gray
+                        1
+                    )
+                
+                # Display controls
+                cv2.putText(
+                    frame_with_viz,
+                    "Controls: 'v' - change viz mode, 'c' - change colormap, 'q' - quit",
+                    (10, frame_height - 100),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (200, 200, 200),  # Light gray
+                    1
+                )
+            
             # Write the frame to the output video
-            if current_viz_mode == 2:
-                # For side-by-side view, we need to create a version without the header
-                out.write(frame_with_viz[header_height:])
+            if current_viz_mode == 3:
+                # For side-by-side view, resize to match the original frame dimensions
+                # This ensures the video writer gets correctly sized frames
+                side_by_side_frame = cv2.resize(
+                    frame_with_viz[header_height:], 
+                    (frame_width, frame_height)
+                )
+                out.write(side_by_side_frame)
             else:
                 out.write(frame_with_viz)
             
