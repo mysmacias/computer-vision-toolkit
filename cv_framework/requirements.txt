@@ -1,0 +1,13 @@
+torch>=1.10.0
+torchvision>=0.11.0
+opencv-python>=4.5.0
+numpy>=1.20.0
+ultralytics>=8.0.0  # For YOLO models and YOLO-based SAM
+matplotlib>=3.3.0
+pillow>=8.0.0
+scikit-learn>=1.0.0  # For DINOv2 dimensionality reduction and clustering
+requests>=2.25.0  # For downloading model weights
+timm>=0.4.12  # For DINOv2 models
+tqdm>=4.61.0  # For progress bars
+tabulate>=0.8.9  # For benchmark reports
+segment-anything>=1.0  # For Meta AI's Segment Anything Model (SAM) 
