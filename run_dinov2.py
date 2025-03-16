@@ -55,6 +55,7 @@ class DINOv2FeatureExtractor:
             self.model = torch.hub.load('facebookresearch/dinov2', model_name)
             self.model = self.model.to(self.device)
             self.model.eval()
+            self.patch_size = 14  # Default patch size for DINOv2
         except Exception as e:
             print(f"Error loading DINOv2 model: {e}")
             print("Trying DINOv2 ViT-S/14 model as fallback...")
@@ -62,6 +63,7 @@ class DINOv2FeatureExtractor:
                 self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
                 self.model = self.model.to(self.device)
                 self.model.eval()
+                self.patch_size = 14
             except Exception as e:
                 print(f"Error loading alternative model: {e}")
                 print("Using torchvision's ViT model as fallback...")
@@ -69,11 +71,16 @@ class DINOv2FeatureExtractor:
                 self.model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
                 self.model = self.model.to(self.device)
                 self.model.eval()
+                self.patch_size = 16
         
-        # Default transforms for preprocessing
+        # Get image size divisible by patch size
+        self.img_size = 518 - (518 % self.patch_size)
+        print(f"Using image size: {self.img_size}")
+        
+        # Default transforms for preprocessing - use the calculated size
         self.transform = T.Compose([
-            T.Resize(518),  # Higher resolution for better results
-            T.CenterCrop(518),
+            T.Resize(self.img_size),
+            T.CenterCrop(self.img_size),
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
@@ -115,6 +122,24 @@ class DINOv2FeatureExtractor:
         else:
             # If no CLS token or unexpected format, return as is
             return features
+            
+    def get_feature_grid_size(self, image):
+        """Calculate the feature grid dimensions based on the image and patch size"""
+        if isinstance(image, np.ndarray):  # If OpenCV image
+            h, w = image.shape[:2]
+        elif isinstance(image, Image.Image):  # If PIL image
+            w, h = image.size
+        else:
+            raise ValueError("Unsupported image type")
+        
+        # Calculate grid dimensions (after resize and center crop)
+        h = w = self.img_size  # Square image after transforms
+        
+        # Calculate feature grid dimensions
+        grid_h = h // self.patch_size
+        grid_w = w // self.patch_size
+        
+        return grid_h, grid_w
 
 # Depth estimation model based on DINOv2 features
 class DINOv2DepthEstimator:
@@ -142,15 +167,17 @@ class DINOv2DepthEstimator:
         # Get patch features from the image
         patch_features = self.feature_extractor.extract_patch_features(image)
         
+        # Get the expected grid size
+        grid_h, grid_w = self.feature_extractor.get_feature_grid_size(image)
+        
         # Extract feature vectors
         with torch.no_grad():
-            # Get feature shape
-            batch_size, num_patches, feature_dim = patch_features.shape
-            features_for_pca = patch_features.squeeze(0).cpu().numpy()
+            # Get feature shape and convert to numpy
+            features_np = patch_features.squeeze(0).cpu().numpy()
             
             # If PCA not fitted yet, collect features
             if not self.is_fitted:
-                self.feature_buffer.append(features_for_pca)
+                self.feature_buffer.append(features_np)
                 if len(self.feature_buffer) >= self.buffer_size:
                     print("Fitting PCA for depth estimation...")
                     # Concatenate all features
@@ -164,30 +191,32 @@ class DINOv2DepthEstimator:
             # Apply PCA to get depth values (or use a placeholder if not fitted)
             if self.is_fitted:
                 # Transform features to get primary component
-                depth_values = self.pca.transform(features_for_pca)
+                depth_values = self.pca.transform(features_np)
             else:
                 # Use placeholder values based on feature norms until PCA is fitted
                 print(f"Collecting features for PCA ({len(self.feature_buffer)}/{self.buffer_size})...")
                 # Feature vector magnitudes can give rough depth estimate
-                depth_values = np.linalg.norm(features_for_pca, axis=1, keepdims=True)
+                depth_values = np.linalg.norm(features_np, axis=1, keepdims=True)
             
-            # Reshape depth values to 2D grid
-            h = int(math.sqrt(num_patches))
-            w = int(math.ceil(num_patches / h))
+            # Check if we have enough features for the expected grid
+            expected_patches = grid_h * grid_w
+            actual_patches = features_np.shape[0]
             
-            # Create depth map
-            if h * w > num_patches:
-                # Pad with zeros if needed
-                depth_map = np.zeros((h, w))
-                for i in range(num_patches):
-                    row = i // w
-                    col = i % w
-                    depth_map[row, col] = depth_values[i]
-            else:
-                depth_map = depth_values.reshape(h, w)
+            if actual_patches < expected_patches:
+                print(f"Warning: Not enough patches. Expected {expected_patches}, got {actual_patches}")
+                # Pad with the mean value
+                padding = np.full((expected_patches - actual_patches, 1), depth_values.mean())
+                depth_values = np.vstack((depth_values, padding))
+            elif actual_patches > expected_patches:
+                # Truncate extra patches
+                depth_values = depth_values[:expected_patches]
             
-            # Resize to match display size
-            depth_map = cv2.resize(depth_map, (518, 518), interpolation=cv2.INTER_LINEAR)
+            # Reshape to grid
+            depth_map = depth_values.reshape(grid_h, grid_w)
+            
+            # Resize to desired output size
+            output_size = (self.feature_extractor.img_size, self.feature_extractor.img_size)
+            depth_map = cv2.resize(depth_map, output_size, interpolation=cv2.INTER_LINEAR)
             
             # Apply smoothing for better visualization
             depth_map = cv2.GaussianBlur(depth_map, (5, 5), 0)
@@ -232,6 +261,9 @@ class DINOv2SemanticSegmenter:
         # Get patch features from the image
         patch_features = self.feature_extractor.extract_patch_features(image)
         
+        # Get the expected grid size
+        grid_h, grid_w = self.feature_extractor.get_feature_grid_size(image)
+        
         # Get features for clustering
         features = patch_features.squeeze(0).cpu().numpy()
         
@@ -265,33 +297,40 @@ class DINOv2SemanticSegmenter:
                 # Predict cluster for each patch
                 clusters = self.kmeans.predict(features_for_clustering)
                 
-                # Reshape to 2D grid
-                num_patches = features.shape[0]
-                h = int(math.sqrt(num_patches))
-                w = int(math.ceil(num_patches / h))
+                # Check if we have enough features for the expected grid
+                expected_patches = grid_h * grid_w
+                actual_patches = features.shape[0]
                 
-                # Create a padded array if needed
-                if h * w > num_patches:
-                    segmentation_map = np.zeros((h, w), dtype=np.int32)
-                    for i in range(num_patches):
-                        row = i // w
-                        col = i % w
-                        segmentation_map[row, col] = clusters[i]
-                else:
-                    segmentation_map = clusters.reshape(h, w)
+                if actual_patches < expected_patches:
+                    print(f"Warning: Not enough patches for segmentation. Expected {expected_patches}, got {actual_patches}")
+                    # Pad with the most common cluster
+                    if len(clusters) > 0:
+                        from collections import Counter
+                        most_common = Counter(clusters).most_common(1)[0][0]
+                        padding = np.full(expected_patches - actual_patches, most_common)
+                        clusters = np.concatenate((clusters, padding))
+                    else:
+                        clusters = np.zeros(expected_patches, dtype=np.int32)
+                elif actual_patches > expected_patches:
+                    # Truncate extra patches
+                    clusters = clusters[:expected_patches]
+                
+                # Reshape to grid
+                segmentation_map = clusters.reshape(grid_h, grid_w)
                 
                 # Apply median filtering to remove noise
                 segmentation_map = cv2.medianBlur(segmentation_map.astype(np.uint8), 3)
                 
                 # Resize to original image size
+                output_size = (self.feature_extractor.img_size, self.feature_extractor.img_size)
                 segmentation_map = cv2.resize(
                     segmentation_map.astype(np.float32), 
-                    (518, 518), 
+                    output_size, 
                     interpolation=cv2.INTER_NEAREST
                 )
                 
                 # Create colored segmentation map
-                colored_segmentation = np.zeros((518, 518, 3), dtype=np.float32)
+                colored_segmentation = np.zeros((self.feature_extractor.img_size, self.feature_extractor.img_size, 3), dtype=np.float32)
                 
                 for cluster_idx in range(self.num_clusters):
                     # Get color for this cluster
@@ -303,20 +342,20 @@ class DINOv2SemanticSegmenter:
         
         # Return a placeholder during initialization
         print(f"Collecting features for segmentation ({len(self.feature_buffer)}/{self.buffer_size})...")
-        placeholder = np.zeros((518, 518, 3), dtype=np.float32)
+        img_size = self.feature_extractor.img_size
+        placeholder = np.zeros((img_size, img_size, 3), dtype=np.float32)
         
         # Generate a nicer placeholder visualization
-        h, w = 518, 518
         for i in range(10):
-            y1, x1 = np.random.randint(0, h), np.random.randint(0, w)
-            y2, x2 = np.random.randint(0, h), np.random.randint(0, w)
+            y1, x1 = np.random.randint(0, img_size), np.random.randint(0, img_size)
+            y2, x2 = np.random.randint(0, img_size), np.random.randint(0, img_size)
             color = np.random.rand(3)
             cv2.line(placeholder, (x1, y1), (x2, y2), color, 2)
         
         cv2.putText(
             placeholder,
             "Initializing segmentation...",
-            (100, 250),
+            (img_size//5, img_size//2),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
             (1, 1, 1),
@@ -342,6 +381,9 @@ class DINOv2FeatureVisualizer:
         """Create RGB visualization of DINOv2 features using PCA"""
         # Get patch features
         patch_features = self.feature_extractor.extract_patch_features(image)
+        
+        # Get the expected grid size
+        grid_h, grid_w = self.feature_extractor.get_feature_grid_size(image)
         
         # Move to numpy for processing
         features = patch_features.squeeze(0).cpu().numpy()
@@ -369,23 +411,25 @@ class DINOv2FeatureVisualizer:
             rgb_features = rgb_features - rgb_features.min(axis=0)
             rgb_features = rgb_features / (rgb_features.max(axis=0) + 1e-8)
             
-            # Reshape to 2D spatial grid
-            num_patches = features.shape[0]
-            h = int(math.sqrt(num_patches))
-            w = int(math.ceil(num_patches / h))
+            # Check if we have enough features for the expected grid
+            expected_patches = grid_h * grid_w
+            actual_patches = features.shape[0]
             
-            # Create feature map
-            if h * w > num_patches:
-                feature_map = np.zeros((h, w, 3))
-                for i in range(num_patches):
-                    row = i // w
-                    col = i % w
-                    feature_map[row, col] = rgb_features[i]
-            else:
-                feature_map = rgb_features.reshape(h, w, 3)
+            if actual_patches < expected_patches:
+                print(f"Warning: Not enough patches for visualization. Expected {expected_patches}, got {actual_patches}")
+                # Pad with zeros
+                padding = np.zeros((expected_patches - actual_patches, 3))
+                rgb_features = np.vstack((rgb_features, padding))
+            elif actual_patches > expected_patches:
+                # Truncate extra patches
+                rgb_features = rgb_features[:expected_patches]
             
-            # Resize to display size
-            feature_map = cv2.resize(feature_map, (518, 518), interpolation=cv2.INTER_LINEAR)
+            # Reshape to grid
+            feature_map = rgb_features.reshape(grid_h, grid_w, 3)
+            
+            # Resize to desired output size
+            output_size = (self.feature_extractor.img_size, self.feature_extractor.img_size)
+            feature_map = cv2.resize(feature_map, output_size, interpolation=cv2.INTER_LINEAR)
             
             # Apply light Gaussian blur for smoother visualization
             feature_map = cv2.GaussianBlur(feature_map, (3, 3), 0)
@@ -396,18 +440,19 @@ class DINOv2FeatureVisualizer:
             print(f"Collecting features for visualization ({len(self.feature_buffer)}/{self.buffer_size})...")
             
             # Create a more informative placeholder
-            placeholder = np.zeros((518, 518, 3), dtype=np.float32)
+            img_size = self.feature_extractor.img_size
+            placeholder = np.zeros((img_size, img_size, 3), dtype=np.float32)
             
             # Add a gradient background
-            y, x = np.mgrid[0:518, 0:518]
-            placeholder[:,:,0] = x / 518.0
-            placeholder[:,:,1] = y / 518.0
+            y, x = np.mgrid[0:img_size, 0:img_size]
+            placeholder[:,:,0] = x / img_size
+            placeholder[:,:,1] = y / img_size
             placeholder[:,:,2] = 0.5
             
             cv2.putText(
                 placeholder,
                 "Initializing feature visualization...",
-                (50, 250),
+                (img_size//10, img_size//2),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
                 (1, 1, 1),
@@ -446,6 +491,10 @@ def main():
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"Camera resolution: {frame_width}x{frame_height}, FPS: {fps}")
+    
+    # Image size used for DINOv2 processing
+    img_size = feature_extractor.img_size
+    print(f"Using processing image size: {img_size}x{img_size}")
     
     # Create output directory if it doesn't exist
     output_dir = 'output_videos'
@@ -504,8 +553,17 @@ def main():
             # Create a copy of the frame for saving
             frame_with_viz = frame.copy()
             
+            # First, preprocess the frame to match DINOv2's expected size
+            # Center-crop to square and resize to consistent size
+            h, w = frame.shape[:2]
+            size = min(h, w)
+            x = (w - size) // 2
+            y = (h - size) // 2
+            cropped_frame = frame[y:y+size, x:x+size]
+            processed_frame = cv2.resize(cropped_frame, (img_size, img_size))
+            
             # Convert to PIL Image for processing
-            pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            pil_image = Image.fromarray(cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB))
             
             # Process the frame depending on the current visualization mode
             depth_map = None
