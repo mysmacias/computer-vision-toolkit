@@ -43,32 +43,82 @@ class YOLOModel(VisionModel):
         Load the YOLO model from Ultralytics.
         """
         try:
-            from ultralytics import YOLO
+            # Set environment variables to avoid MKL threading issues
+            import os
+            os.environ['MKL_NUM_THREADS'] = '1'
+            os.environ['NUMEXPR_NUM_THREADS'] = '1'
+            os.environ['OMP_NUM_THREADS'] = '1'
+            
+            try:
+                from ultralytics import YOLO
+            except ImportError as e:
+                print(f"Error: Ultralytics package not found: {e}")
+                print("Please install it using: pip install ultralytics")
+                return False
             
             model_path = f"{self.model_name}.pt"
             
-            # Check if model exists in the current directory or ultralytics cache
+            # First check if model exists in the current directory
+            current_dir_path = os.path.join(os.getcwd(), model_path)
+            framework_dir_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), model_path)
+            
+            # Printing paths for debugging
+            print(f"Checking for model at current directory: {current_dir_path}")
+            print(f"Checking for model at framework directory: {framework_dir_path}")
+            
+            # Check if model exists in various locations
             cached_model = None
             ultralytics_dir = os.path.expanduser("~/.cache/ultralytics/")
-            if os.path.exists(model_path):
-                cached_model = model_path
-                print(f"Using model found in current directory: {model_path}")
+            
+            if os.path.exists(current_dir_path):
+                cached_model = current_dir_path
+                print(f"Using model found in current directory: {current_dir_path}")
+            elif os.path.exists(framework_dir_path):
+                cached_model = framework_dir_path
+                print(f"Using model found in framework directory: {framework_dir_path}")
             elif os.path.exists(os.path.join(ultralytics_dir, "models", model_path)):
                 cached_model = os.path.join(ultralytics_dir, "models", model_path)
                 print(f"Using cached model: {cached_model}")
+            else:
+                print(f"Model not found locally, will attempt to download: {model_path}")
+            
+            # Load the model with explicit error handling
+            try:
+                print(f"Loading {self.model_name} model...")
+                if cached_model:
+                    # Try loading from explicit path first
+                    self.model = YOLO(cached_model)
+                else:
+                    # Fall back to letting ultralytics handle it
+                    self.model = YOLO(self.model_name)
                 
-            # Load the model, will download if not found
-            print(f"Loading {self.model_name} model...")
-            self.model = YOLO(self.model_name)
-            print(f"Model loaded successfully: {self.model_name}")
-            
-            # Set model to appropriate device
-            self.model.to(self.device)
-            
-            return True
+                print(f"Model loaded successfully: {self.model_name}")
+                
+                # Set model to appropriate device
+                try:
+                    self.model.to(self.device)
+                    print(f"Model successfully moved to device: {self.device}")
+                except Exception as dev_err:
+                    print(f"Warning: Failed to move model to {self.device}: {dev_err}")
+                    print("Continuing with default device")
+                
+                return True
+            except Exception as load_err:
+                print(f"Failed to load YOLO model: {load_err}")
+                # If it failed, try once more with a different approach
+                try:
+                    print("Attempting alternative loading method...")
+                    self.model = YOLO(self.model_name, task='detect')
+                    print("Alternative loading succeeded")
+                    return True
+                except Exception as alt_err:
+                    print(f"Alternative loading also failed: {alt_err}")
+                    return False
             
         except Exception as e:
+            import traceback
             print(f"Error loading YOLO model: {e}")
+            print(traceback.format_exc())
             return False
     
     def preprocess_frame(self, frame):

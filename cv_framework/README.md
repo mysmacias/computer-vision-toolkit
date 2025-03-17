@@ -12,6 +12,7 @@ A unified framework for computer vision models with a clean, modular design and 
 - **Runtime Configuration**: Adjust parameters like confidence threshold during execution
 - **Modular Design**: Easily add new models to the framework
 - **Benchmarking**: Compare performance of different models
+- **SAM**: Segment Anything Model for interactive segmentation
 
 ## Installation
 
@@ -70,7 +71,7 @@ The framework includes a benchmark utility to compare the performance of differe
 python -m cv_framework.benchmark
 
 # Benchmark specific models
-python -m cv_framework.benchmark --models yolov8s detr_resnet50 dinov2_vits14
+python -m cv_framework.benchmark --models yolov8s detr_resnet50 dinov2_vits14 sam_vit_b
 
 # Specify the number of iterations
 python -m cv_framework.benchmark --iterations 50
@@ -80,6 +81,36 @@ python -m cv_framework.benchmark --input-size 640 480
 
 # List models available for benchmarking
 python -m cv_framework.benchmark --list
+```
+
+#### Benchmark Examples
+
+Here are some practical examples for benchmarking models:
+
+```bash
+# Compare lightweight vs. heavier models on CPU
+python benchmark.py --models yolov8n yolov8x --device cpu --iterations 20
+
+# Compare models with larger input resolution
+python benchmark.py --models yolov8s detr_resnet50 --input-size 1280 720 --iterations 30
+
+# Benchmark all YOLO models to compare differences in size/performance
+python benchmark.py --models yolov8n yolov8s yolov8m yolov8l yolov8x
+
+# Compare segmentation models (YOLO-seg and SAM)
+python benchmark.py --models yolov8n-seg yolov8s-seg sam_vit_b
+
+# Benchmark on specific GPU if you have multiple
+python benchmark.py --models dinov2_vits14 dinov2_vitl14 --device cuda:0
+
+# Save benchmark results to custom directory
+python benchmark.py --models yolov8s detr_resnet50 --output-dir my_benchmarks
+
+# Quick benchmark with fewer iterations (useful for testing)
+python benchmark.py --models yolov8s --iterations 10
+
+# Maximum quality benchmark with many iterations for publication-quality results
+python benchmark.py --models yolov8s detr_resnet50 dinov2_vits14 --iterations 200
 ```
 
 The benchmark utility generates:
@@ -92,7 +123,7 @@ The benchmark utility generates:
 
 | Argument | Short | Description |
 |----------|-------|-------------|
-| `--model` | `-m` | Model to use (e.g., yolov8s, faster_rcnn, ssd300, detr_resnet50, dinov2_vits14) |
+| `--model` | `-m` | Model to use (e.g., yolov8s, faster_rcnn, ssd300, detr_resnet50, dinov2_vits14, sam_vit_b) |
 | `--camera` | `-c` | Camera index to use |
 | `--device` | `-d` | Device to run on (e.g., cpu, cuda:0) |
 | `--threshold` | `-t` | Confidence threshold (0.0 to 1.0) |
@@ -158,6 +189,20 @@ DINOv2 capabilities:
 **Interactive controls** for DINOv2:
 - Press 'v' to cycle through visualization modes
 - Press 'c' to change depth colormaps
+
+### SAM Models
+
+- `sam_vit_b`, `sam_vit_l`, `sam_vit_h`: Original Meta AI Segment Anything Models with different ViT backbones
+- `yolov8n-seg`, `yolov8s-seg`, etc.: Ultralytics YOLOv8 segmentation models compatible with SAM interface
+- SAM provides:
+  - Automatic segmentation of all objects in the frame
+  - Interactive segmentation using mouse clicks
+  - Controls:
+    - 'i': Toggle between automatic and interactive modes
+    - 'c': Clear all points in interactive mode
+    - 'a': Return to automatic segmentation mode
+    - Left-click: Add positive point (select object)
+    - Right-click: Add negative point (remove background)
 
 ## Extending the Framework
 
