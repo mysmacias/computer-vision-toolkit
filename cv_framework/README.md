@@ -13,6 +13,7 @@ A unified framework for computer vision models with a clean, modular design and 
 - **Modular Design**: Easily add new models to the framework
 - **Benchmarking**: Compare performance of different models
 - **SAM**: Segment Anything Model for interactive segmentation
+- **Automatic Model Downloads**: Models are downloaded automatically when needed - no manual downloading required
 
 ## Installation
 
@@ -34,6 +35,22 @@ pip install -r requirements.txt
 - NumPy 1.20+
 - scikit-learn 1.0+ (for DINOv2)
 - Other model-specific dependencies (e.g., ultralytics for YOLO)
+- Internet connection (for first-time model downloads)
+
+## Automatic Model Management
+
+This framework includes an automatic model download system. When you select a model that isn't already downloaded:
+
+1. The system will check if the model exists locally
+2. If not found, it will automatically download the model from official sources
+3. Progress will be displayed during download
+4. After downloading, the model is cached for future use
+
+Supported models with auto-download:
+- All YOLOv8 variants (nano, small, medium, large) for detection, segmentation and pose estimation
+- DINOv2 models via PyTorch Hub
+
+This ensures that you can use all features immediately without worrying about manually downloading model weights.
 
 ## Usage
 

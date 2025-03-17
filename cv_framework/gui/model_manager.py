@@ -19,6 +19,7 @@ if str(parent_dir) not in sys.path:
     sys.path.append(str(parent_dir))
 
 from PySide6.QtGui import QImage, QPixmap
+from utils.model_downloader import get_model_path, download_dinov2_model
 
 class ModelInterface:
     """Base interface for all models"""
@@ -32,15 +33,21 @@ class ModelInterface:
         """Load the model"""
         raise NotImplementedError("Subclasses must implement load()")
         
-    def process_frame(self, frame):
+    def process_frame(self, frame, transformed_frame=None):
         """Process a frame with the model
         
         Args:
-            frame (QImage): Input frame
+            frame (QImage): Original input frame
+            transformed_frame (QImage, optional): Frame with transforms applied
+                                               If None, the original frame is used
             
         Returns:
             QImage: Processed frame with detections
         """
+        # By default, use the transformed frame if provided
+        process_frame = transformed_frame if transformed_frame is not None else frame
+        
+        # This should be overridden by subclasses
         raise NotImplementedError("Subclasses must implement process_frame()")
         
     def set_threshold(self, threshold):
@@ -196,11 +203,13 @@ class FasterRCNNModel(ModelInterface):
             traceback.print_exc()
             return False
         
-    def process_frame(self, frame):
+    def process_frame(self, frame, transformed_frame=None):
         """Process a frame with FasterRCNN
         
         Args:
-            frame (QImage): Input frame
+            frame (QImage): Original input frame
+            transformed_frame (QImage, optional): Frame with transforms applied
+                                               If None, the original frame is used
             
         Returns:
             QImage: Processed frame with detections
@@ -209,8 +218,11 @@ class FasterRCNNModel(ModelInterface):
             return frame
             
         try:
+            # Use transformed frame if provided, otherwise use original
+            image_to_process = transformed_frame if transformed_frame is not None else frame
+            
             # Convert QImage to numpy array
-            image_np = self.to_numpy(frame)
+            image_np = self.to_numpy(image_to_process)
             
             # Create a copy for drawing
             output_image = image_np.copy()
@@ -315,15 +327,19 @@ class FasterRCNNModel(ModelInterface):
 
 
 class YOLOv8Model(ModelInterface):
-    """YOLOv8 model implementation"""
+    """YOLOv8 Object Detection model implementation"""
     
     def __init__(self):
         super().__init__()
-        self.model_path = str(parent_dir / "yolov8s.pt")
+        self.model_filename = "yolov8s.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8"
         self.last_inference_time = 0
         self.fps_alpha = 0.9  # For FPS smoothing
         self.current_fps = 0
         self.input_size = 640  # Default YOLO input size
+        self.iou_threshold = 0.45
+        self.max_detections = 20
         
     def load(self):
         """Load the YOLOv8 model"""
@@ -335,9 +351,13 @@ class YOLOv8Model(ModelInterface):
                 print("Ultralytics not found. Please install with: pip install ultralytics")
                 return False
                 
-            # Check if model file exists
-            if not os.path.exists(self.model_path):
-                print(f"Model file not found: {self.model_path}")
+            # Get model path (download if missing)
+            try:
+                model_path = get_model_path(self.model_filename)
+                self.model_path = str(model_path)
+                print(f"Using model at: {self.model_path}")
+            except Exception as e:
+                print(f"Error obtaining model path: {str(e)}")
                 return False
                 
             # Load the model
@@ -348,20 +368,22 @@ class YOLOv8Model(ModelInterface):
                 # Fuse conv and bn layers for faster inference
                 self.model.fuse()
             
-            print("YOLOv8 model loaded successfully")
+            print(f"{self.model_name} model loaded successfully")
             return True
             
         except Exception as e:
-            print(f"Error loading YOLOv8 model: {str(e)}")
+            print(f"Error loading {self.model_name} model: {str(e)}")
             import traceback
             traceback.print_exc()
             return False
         
-    def process_frame(self, frame):
+    def process_frame(self, frame, transformed_frame=None):
         """Process a frame with YOLOv8
         
         Args:
-            frame (QImage): Input frame
+            frame (QImage): Original input frame
+            transformed_frame (QImage, optional): Frame with transforms applied
+                                               If None, the original frame is used
             
         Returns:
             QImage: Processed frame with detections
@@ -370,8 +392,11 @@ class YOLOv8Model(ModelInterface):
             return frame
             
         try:
+            # Use transformed frame if provided, otherwise use original
+            image_to_process = transformed_frame if transformed_frame is not None else frame
+            
             # Convert QImage to numpy array
-            image_np = self.to_numpy(frame)
+            image_np = self.to_numpy(image_to_process)
             
             # Create a copy for output
             output_image = image_np.copy()
@@ -383,9 +408,9 @@ class YOLOv8Model(ModelInterface):
             start_time = time.time()
             results = self.model(image_np, 
                                conf=self.confidence_threshold,
-                               iou=0.45,  # Lower IOU threshold for faster NMS
-                               max_det=20,  # Limit detections for speed
-                               verbose=False)  # Disable verbose output
+                               iou=self.iou_threshold,
+                               max_det=self.max_detections,
+                               verbose=False)
             
             # Calculate and smooth FPS
             current_time = time.time() - start_time
@@ -427,10 +452,10 @@ class YOLOv8Model(ModelInterface):
                 
                 # Draw FPS and detection count
                 detection_count = len(boxes) if 'boxes' in locals() else 0
-                status_text = f"FPS: {self.current_fps:.1f} | Detections: {detection_count} | YOLOv8"
+                status_text = f"FPS: {self.current_fps:.1f} | Detections: {detection_count} | {self.model_name}"
             else:
                 # Draw FPS if no detections
-                status_text = f"FPS: {self.current_fps:.1f} | No detections | YOLOv8"
+                status_text = f"FPS: {self.current_fps:.1f} | No detections | {self.model_name}"
             
             # Draw background for status text
             status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
@@ -451,15 +476,19 @@ class YOLOv8Model(ModelInterface):
 
 
 class YOLOv8SegmentationModel(ModelInterface):
-    """YOLOv8 segmentation model implementation"""
+    """YOLOv8 Instance Segmentation model implementation"""
     
     def __init__(self):
         super().__init__()
-        self.model_path = str(parent_dir / "yolov8s-seg.pt")
+        self.model_filename = "yolov8s-seg.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Seg"
         self.last_inference_time = 0
         self.fps_alpha = 0.9  # For FPS smoothing
         self.current_fps = 0
         self.input_size = 640  # Default YOLO input size
+        self.iou_threshold = 0.45
+        self.max_detections = 10
         
     def load(self):
         """Load the YOLOv8 segmentation model"""
@@ -471,9 +500,13 @@ class YOLOv8SegmentationModel(ModelInterface):
                 print("Ultralytics not found. Please install with: pip install ultralytics")
                 return False
                 
-            # Check if model file exists
-            if not os.path.exists(self.model_path):
-                print(f"Model file not found: {self.model_path}")
+            # Get model path (download if missing)
+            try:
+                model_path = get_model_path(self.model_filename)
+                self.model_path = str(model_path)
+                print(f"Using model at: {self.model_path}")
+            except Exception as e:
+                print(f"Error obtaining model path: {str(e)}")
                 return False
                 
             # Load the model
@@ -484,20 +517,22 @@ class YOLOv8SegmentationModel(ModelInterface):
                 # Fuse conv and bn layers for faster inference
                 self.model.fuse()
             
-            print("YOLOv8-Seg model loaded successfully")
+            print(f"{self.model_name} model loaded successfully")
             return True
             
         except Exception as e:
-            print(f"Error loading YOLOv8-Seg model: {str(e)}")
+            print(f"Error loading {self.model_name} model: {str(e)}")
             import traceback
             traceback.print_exc()
             return False
         
-    def process_frame(self, frame):
+    def process_frame(self, frame, transformed_frame=None):
         """Process a frame with YOLOv8 segmentation
         
         Args:
-            frame (QImage): Input frame
+            frame (QImage): Original input frame
+            transformed_frame (QImage, optional): Frame with transforms applied
+                                               If None, the original frame is used
             
         Returns:
             QImage: Processed frame with detections and segmentation masks
@@ -506,8 +541,11 @@ class YOLOv8SegmentationModel(ModelInterface):
             return frame
             
         try:
+            # Use transformed frame if provided, otherwise use original
+            image_to_process = transformed_frame if transformed_frame is not None else frame
+            
             # Convert QImage to numpy array
-            image_np = self.to_numpy(frame)
+            image_np = self.to_numpy(image_to_process)
             
             # Create a copy of the image for drawing
             output_image = image_np.copy()
@@ -516,9 +554,9 @@ class YOLOv8SegmentationModel(ModelInterface):
             start_time = time.time()
             results = self.model(image_np, 
                                conf=self.confidence_threshold,
-                               iou=0.45,  # Lower IOU threshold for faster NMS
-                               max_det=10,  # Limit detections for speed
-                               verbose=False)  # Disable verbose output
+                               iou=self.iou_threshold,
+                               max_det=self.max_detections,
+                               verbose=False)
             
             # Calculate and smooth FPS
             current_time = time.time() - start_time
@@ -603,14 +641,14 @@ class YOLOv8SegmentationModel(ModelInterface):
                     
                     # Draw FPS and detection count
                     mask_count = len(masks)
-                    status_text = f"FPS: {self.current_fps:.1f} | Masks: {mask_count} | YOLOv8-Seg"
+                    status_text = f"FPS: {self.current_fps:.1f} | Masks: {mask_count} | {self.model_name}"
                 except Exception as e:
                     # Error processing mask results
                     print(f"Error processing masks: {e}")
-                    status_text = f"FPS: {self.current_fps:.1f} | Mask error | YOLOv8-Seg"
+                    status_text = f"FPS: {self.current_fps:.1f} | Mask error | {self.model_name}"
             else:
                 # No detections
-                status_text = f"FPS: {self.current_fps:.1f} | No masks | YOLOv8-Seg"
+                status_text = f"FPS: {self.current_fps:.1f} | No masks | {self.model_name}"
             
             # Draw background for status text
             status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
@@ -625,6 +663,472 @@ class YOLOv8SegmentationModel(ModelInterface):
             
         except Exception as e:
             print(f"Error processing frame: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return frame
+
+
+class YOLOv8NanoModel(YOLOv8Model):
+    """YOLOv8 Nano model - smaller and faster"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_filename = "yolov8n.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Nano"
+
+
+class YOLOv8MediumModel(YOLOv8Model):
+    """YOLOv8 Medium model - balanced size and accuracy"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_filename = "yolov8m.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Medium"
+
+
+class YOLOv8LargeModel(YOLOv8Model):
+    """YOLOv8 Large model - high accuracy but slower"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_filename = "yolov8l.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Large"
+
+
+class YOLOv8PoseModel(ModelInterface):
+    """YOLOv8 Pose Estimation model implementation"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_filename = "yolov8s-pose.pt"  # Changed from nano to small for better performance
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Pose"
+        self.last_inference_time = 0
+        self.fps_alpha = 0.9  # For FPS smoothing
+        self.current_fps = 0
+        self.input_size = 640  # Default YOLO input size
+        self.iou_threshold = 0.45
+        self.max_detections = 20
+        
+    def load(self):
+        """Load the YOLOv8 pose model"""
+        try:
+            # Attempt to import ultralytics
+            try:
+                from ultralytics import YOLO
+            except ImportError:
+                print("Ultralytics not found. Please install with: pip install ultralytics")
+                return False
+                
+            # Get model path (download if missing)
+            try:
+                model_path = get_model_path(self.model_filename)
+                self.model_path = str(model_path)
+                print(f"Using model at: {self.model_path}")
+            except Exception as e:
+                print(f"Error obtaining model path: {str(e)}")
+                return False
+                
+            # Load the model
+            self.model = YOLO(self.model_path)
+            
+            # Set model parameters for faster inference
+            if hasattr(self.model, 'fuse') and callable(self.model.fuse):
+                # Fuse conv and bn layers for faster inference
+                self.model.fuse()
+            
+            print(f"{self.model_name} model loaded successfully")
+            return True
+            
+        except Exception as e:
+            print(f"Error loading {self.model_name} model: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+    def process_frame(self, frame, transformed_frame=None):
+        """Process a frame with YOLOv8 pose estimation
+        
+        Args:
+            frame (QImage): Original input frame
+            transformed_frame (QImage, optional): Frame with transforms applied
+                                               If None, the original frame is used
+            
+        Returns:
+            QImage: Processed frame with pose keypoints
+        """
+        if self.model is None:
+            return frame
+            
+        try:
+            # Use transformed frame if provided, otherwise use original
+            image_to_process = transformed_frame if transformed_frame is not None else frame
+            
+            # Convert QImage to numpy array
+            image_np = self.to_numpy(image_to_process)
+            
+            # Create a copy for output
+            output_image = image_np.copy()
+            
+            # Run inference with optimized settings
+            start_time = time.time()
+            results = self.model(image_np, 
+                               conf=self.confidence_threshold,
+                               iou=self.iou_threshold,
+                               max_det=self.max_detections,
+                               verbose=False)
+            
+            # Calculate and smooth FPS
+            current_time = time.time() - start_time
+            if self.last_inference_time > 0:
+                self.current_fps = self.fps_alpha * self.current_fps + (1 - self.fps_alpha) * (1.0 / current_time)
+            else:
+                self.current_fps = 1.0 / current_time
+            self.last_inference_time = current_time
+            
+            # Get keypoints results
+            if len(results) > 0:
+                try:
+                    # Extract keypoints data
+                    keypoints = results[0].keypoints.data.cpu().numpy()
+                    
+                    if len(keypoints) > 0:
+                        # Color definitions for different body parts
+                        # Define connections for drawing skeleton lines
+                        skeleton_connections = [
+                            (5, 7), (7, 9),   # Right arm
+                            (6, 8), (8, 10),  # Left arm
+                            (5, 6),           # Shoulders
+                            (5, 11), (6, 12), # Torso
+                            (11, 13), (13, 15), # Right leg
+                            (12, 14), (14, 16), # Left leg
+                            (11, 12),         # Hips
+                            (0, 1), (1, 3), (3, 5), # Face-Right side
+                            (0, 2), (2, 4), (4, 6)  # Face-Left side
+                        ]
+                        
+                        # Draw person count
+                        person_count = len(keypoints)
+                        
+                        # Draw each person's keypoints and connections
+                        for person_idx, kpts in enumerate(keypoints):
+                            # Select a color based on person index
+                            person_color = (0, 255 - (50 * person_idx) % 255, (80 * person_idx) % 255)
+                            
+                            # Draw keypoints
+                            for idx, (x, y, conf) in enumerate(kpts):
+                                if conf > self.confidence_threshold:
+                                    # Different colors for different keypoint types
+                                    if idx <= 4:  # Face keypoints
+                                        color = (0, 255, 0)  # Green
+                                    elif idx <= 10:  # Upper body
+                                        color = (255, 0, 0)  # Blue
+                                    else:  # Lower body
+                                        color = (0, 0, 255)  # Red
+                                    
+                                    cv2.circle(output_image, (int(x), int(y)), 5, color, -1)
+                            
+                            # Draw skeleton connections
+                            for connection in skeleton_connections:
+                                idx1, idx2 = connection
+                                if kpts[idx1, 2] > self.confidence_threshold and kpts[idx2, 2] > self.confidence_threshold:
+                                    pt1 = (int(kpts[idx1, 0]), int(kpts[idx1, 1]))
+                                    pt2 = (int(kpts[idx2, 0]), int(kpts[idx2, 1]))
+                                    cv2.line(output_image, pt1, pt2, person_color, 2)
+                        
+                        # Draw status text
+                        status_text = f"FPS: {self.current_fps:.1f} | Persons: {person_count} | {self.model_name}"
+                    else:
+                        # No people detected
+                        status_text = f"FPS: {self.current_fps:.1f} | No persons detected | {self.model_name}"
+                except Exception as e:
+                    print(f"Error processing pose results: {e}")
+                    status_text = f"FPS: {self.current_fps:.1f} | Error processing poses | {self.model_name}"
+            else:
+                # No detections
+                status_text = f"FPS: {self.current_fps:.1f} | No detections | {self.model_name}"
+            
+            # Draw background for status text
+            status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.rectangle(output_image, (5, 5), (5 + status_size[0] + 10, 5 + status_size[1] + 10), (0, 0, 0), -1)
+            
+            # Draw status text
+            cv2.putText(output_image, status_text, (10, 30), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Convert back to QImage
+            return self.to_qimage(output_image)
+            
+        except Exception as e:
+            print(f"Error processing frame: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return frame
+            
+
+# Add YOLO model variants for segmentation
+class YOLOv8NanoSegmentationModel(YOLOv8SegmentationModel):
+    """YOLOv8 Nano Segmentation model - smaller and faster"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_filename = "yolov8n-seg.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Nano-Seg"
+
+
+class YOLOv8MediumSegmentationModel(YOLOv8SegmentationModel):
+    """YOLOv8 Medium Segmentation model - balanced size and accuracy"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_filename = "yolov8m-seg.pt"
+        self.model_path = str(parent_dir / self.model_filename)
+        self.model_name = "YOLOv8-Medium-Seg"
+
+
+class DINOv2Model(ModelInterface):
+    """DINOv2 Vision Transformer implementation with multiple tasks"""
+    
+    def __init__(self):
+        super().__init__()
+        self.model_path = None  # DINOv2 is loaded from Torch Hub
+        self.model_name = "DINOv2"
+        self.last_inference_time = 0
+        self.fps_alpha = 0.9  # For FPS smoothing
+        self.current_fps = 0
+        self.active_task = "features"  # Default task: 'features', 'segmentation', 'depth'
+        self.feature_dim_reduction = "pca"  # 'pca' or 'tsne'
+        self.segment_classes = 5  # Number of segments for unsupervised segmentation
+        self.dino_variant = 'dinov2_vits14'  # Default to small model
+        
+    def load(self):
+        """Load the DINOv2 model"""
+        try:
+            # Apply PyTorch version compatibility patch
+            self._patch_interpolate()
+            
+            # Try to import the DINOv2 model from models directory
+            sys.path.append(str(parent_dir))
+            try:
+                from models.dinov2_model import DINOv2Model as BaseDINOv2Model
+            except ImportError:
+                print("DINOv2 model implementation not found. Please ensure models/dinov2_model.py exists.")
+                return False
+            
+            # Create the feature extractor based on run_dinov2.py implementation
+            try:
+                print(f"Loading DINOv2 model variant: {self.dino_variant}...")
+                self.model = BaseDINOv2Model(model_name=self.dino_variant)
+                
+                # Try loading the model
+                success = self.model.load_model()
+                
+                if not success:
+                    print("Standard loading failed, attempting direct download...")
+                    try:
+                        # Try direct download if the regular loading failed
+                        with torch.no_grad():
+                            dinov2_model = torch.hub.load('facebookresearch/dinov2', self.dino_variant)
+                            dinov2_model = dinov2_model.to(self.model.device)
+                            dinov2_model.eval()
+                            
+                            # If direct download worked, set it in our model wrapper
+                            self.model.model = dinov2_model
+                            print(f"Successfully downloaded {self.dino_variant} directly")
+                            success = True
+                    except Exception as direct_error:
+                        print(f"Direct download failed: {direct_error}")
+                        success = self.model.model == "simplified"  # Check if simplified model created
+                
+                if success:
+                    print(f"{self.model_name} model loaded successfully")
+                    return True
+                else:
+                    print("Failed to load DINOv2 model through any method")
+                    return False
+                
+            except Exception as e:
+                print(f"Error initializing DINOv2 model: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return False
+                
+        except Exception as e:
+            print(f"Error loading DINOv2 model: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _patch_interpolate(self):
+        """
+        Monkey patch the interpolate function to handle older PyTorch versions
+        by removing the antialias parameter if it's not supported
+        """
+        try:
+            orig_interpolate = torch.nn.functional.interpolate
+            
+            def patched_interpolate(input, size=None, scale_factor=None, mode='nearest', 
+                                   align_corners=None, recompute_scale_factor=None, 
+                                   antialias=None):
+                # Remove antialias parameter for older PyTorch versions
+                if 'antialias' not in orig_interpolate.__code__.co_varnames:
+                    return orig_interpolate(input, size, scale_factor, mode, 
+                                           align_corners, recompute_scale_factor)
+                else:
+                    return orig_interpolate(input, size, scale_factor, mode, 
+                                           align_corners, recompute_scale_factor, antialias)
+                    
+            # Replace the original interpolate function with our patched version
+            torch.nn.functional.interpolate = patched_interpolate
+            print("Applied PyTorch interpolate patch for compatibility")
+        except Exception as e:
+            print(f"Failed to apply interpolate patch: {e}")
+            
+    def set_active_task(self, task):
+        """Set the active visualization task
+        
+        Args:
+            task (str): Task name - 'features', 'segmentation', or 'depth'
+        """
+        valid_tasks = ['features', 'segmentation', 'depth']
+        if task in valid_tasks:
+            self.active_task = task
+            # Update model's settings if applicable
+            if hasattr(self.model, 'dim_reduction') and task == 'features':
+                self.model.dim_reduction = self.feature_dim_reduction
+            if hasattr(self.model, 'segment_classes') and task == 'segmentation':
+                self.model.segment_classes = self.segment_classes
+            print(f"Active task set to: {task}")
+        else:
+            print(f"Invalid task: {task}. Must be one of {valid_tasks}")
+            
+    def set_feature_dim_reduction(self, method):
+        """Set the feature dimensionality reduction method
+        
+        Args:
+            method (str): Method name - 'pca' or 'tsne'
+        """
+        valid_methods = ['pca', 'tsne']
+        if method in valid_methods:
+            self.feature_dim_reduction = method
+            if hasattr(self.model, 'dim_reduction'):
+                self.model.dim_reduction = method
+            print(f"Feature dimensionality reduction set to: {method}")
+        else:
+            print(f"Invalid method: {method}. Must be one of {valid_methods}")
+            
+    def set_segment_classes(self, num_classes):
+        """Set the number of segment classes for unsupervised segmentation
+        
+        Args:
+            num_classes (int): Number of segment classes (2-10)
+        """
+        if 2 <= num_classes <= 10:
+            self.segment_classes = num_classes
+            if hasattr(self.model, 'segment_classes'):
+                self.model.segment_classes = num_classes
+            print(f"Segment classes set to: {num_classes}")
+        else:
+            print(f"Invalid number of segment classes: {num_classes}. Must be between 2 and 10")
+        
+    def process_frame(self, frame, transformed_frame=None):
+        """Process a frame with DINOv2 based on the active task
+        
+        Args:
+            frame (QImage): Original input frame
+            transformed_frame (QImage, optional): Frame with transforms applied
+                                               If None, the original frame is used
+            
+        Returns:
+            QImage: Processed frame with visualizations
+        """
+        if self.model is None:
+            return frame
+            
+        try:
+            # Use transformed frame if provided, otherwise use original
+            image_to_process = transformed_frame if transformed_frame is not None else frame
+            
+            # Convert QImage to numpy array
+            image_np = self.to_numpy(image_to_process)
+            
+            # Create a copy for output (also used as fallback if processing fails)
+            output_image = image_np.copy()
+            
+            try:
+                # Run inference based on the active task
+                start_time = time.time()
+                
+                # Ensure frame dimensions are compatible with patch size
+                if hasattr(self.model, 'patch_size'):
+                    patch_size = self.model.patch_size
+                    h, w = image_np.shape[:2]
+                    new_h = ((h // patch_size) * patch_size)
+                    new_w = ((w // patch_size) * patch_size)
+                    if h != new_h or w != new_w:
+                        image_np = cv2.resize(image_np, (new_w, new_h))
+                
+                # Preprocess the frame for model input
+                preprocessed_data = self.model.preprocess_frame(image_np)
+                
+                # Extract features
+                features = self.model.extract_features(preprocessed_data)
+                
+                # Process based on selected task
+                if self.active_task == 'features':
+                    # Visualize features with PCA or t-SNE
+                    visualization = self.model.visualize_features(features)
+                    if visualization is not None:
+                        output_image = visualization
+                elif self.active_task == 'segmentation':
+                    # Run unsupervised segmentation
+                    predictions = self.model.segment_image(features)
+                    visualization = self.model.visualize_predictions(image_np, predictions)
+                    if visualization is not None:
+                        output_image = visualization
+                elif self.active_task == 'depth':
+                    # Estimate depth
+                    predictions = self.model.estimate_depth(features)
+                    visualization = self.model.visualize_predictions(image_np, predictions)
+                    if visualization is not None:
+                        output_image = visualization
+                
+                # Calculate and smooth FPS
+                current_time = time.time() - start_time
+                if self.last_inference_time > 0:
+                    self.current_fps = self.fps_alpha * self.current_fps + (1 - self.fps_alpha) * (1.0 / current_time)
+                else:
+                    self.current_fps = 1.0 / current_time
+                self.last_inference_time = current_time
+                
+                # Status message for successful processing
+                task_name = self.active_task.capitalize()
+                method_info = f" ({self.feature_dim_reduction})" if self.active_task == 'features' else ""
+                status_text = f"FPS: {self.current_fps:.1f} | {task_name}{method_info} | {self.model_name}"
+            except Exception as e:
+                # If any processing fails, use the original image and show error
+                print(f"Error in DINOv2 processing: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                status_text = f"Error: {str(e)[:30]}... | Task: {self.active_task} | {self.model_name}"
+            
+            # Draw background for status text (always do this)
+            status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.rectangle(output_image, (5, 5), (5 + status_size[0] + 10, 5 + status_size[1] + 10), (0, 0, 0), -1)
+            
+            # Draw status text
+            cv2.putText(output_image, status_text, (10, 30), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Convert back to QImage
+            return self.to_qimage(output_image)
+            
+        except Exception as e:
+            print(f"Critical error processing frame with DINOv2: {str(e)}")
             import traceback
             traceback.print_exc()
             return frame
@@ -658,6 +1162,16 @@ class ModelManager:
             model = YOLOv8Model()
         elif model_name == "YOLOv8-Segmentation":
             model = YOLOv8SegmentationModel()
+        elif model_name == "YOLOv8-Nano":
+            model = YOLOv8NanoModel()
+        elif model_name == "YOLOv8-Medium":
+            model = YOLOv8MediumModel()
+        elif model_name == "YOLOv8-Large":
+            model = YOLOv8LargeModel()
+        elif model_name == "YOLOv8-Pose":
+            model = YOLOv8PoseModel()
+        elif model_name == "DINOv2":
+            model = DINOv2Model()
         else:
             print(f"Unknown model: {model_name}")
             return None

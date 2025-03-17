@@ -9,6 +9,7 @@ import sys
 import time
 import gc
 from pathlib import Path
+import numpy as np
 
 # Add parent directory to system path for imports
 current_dir = Path(__file__).resolve().parent
@@ -28,7 +29,13 @@ from PySide6.QtGui import QImage, QPixmap, QIcon, QAction
 # Import other modules we'll create
 from gui.camera_thread import CameraThread
 from gui.visualization_widget import VisualizationWidget
-from gui.model_manager import FasterRCNNModel, YOLOv8Model, YOLOv8SegmentationModel, ModelInterface
+from gui.transforms_panel import TransformsPanel
+from gui.model_manager import (
+    FasterRCNNModel, YOLOv8Model, YOLOv8SegmentationModel, 
+    YOLOv8NanoModel, YOLOv8MediumModel, YOLOv8LargeModel,
+    YOLOv8NanoSegmentationModel, YOLOv8MediumSegmentationModel,
+    YOLOv8PoseModel, DINOv2Model, ModelInterface
+)
 
 class ComputerVisionApp(QMainWindow):
     """Main application window for the Computer Vision Toolkit"""
@@ -61,224 +68,225 @@ class ComputerVisionApp(QMainWindow):
         
     def setup_ui(self):
         """Set up the user interface"""
-        # Central widget - visualization area
-        self.visualization = VisualizationWidget(self)
-        self.setCentralWidget(self.visualization)
+        # Central widget
+        central_widget = QWidget()
+        main_layout = QVBoxLayout(central_widget)
         
-        # Create status bar
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
+        # Create video display area
+        self.visualization = VisualizationWidget()
+        main_layout.addWidget(self.visualization)
         
-        # Create menu bar
-        self.create_menu_bar()
+        # Set up control panel on the right
+        control_dock = QDockWidget("Controls")
+        control_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetFloatable | 
+                               QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        control_widget = QWidget()
+        control_layout = QVBoxLayout(control_widget)
         
-        # Create dock widgets
-        self.create_model_dock()
-        self.create_camera_dock()
-        self.create_parameters_dock()
-        
-    def create_menu_bar(self):
-        """Create the application menu bar"""
-        menu_bar = self.menuBar()
-        
-        # File menu
-        file_menu = menu_bar.addMenu("&File")
-        
-        # Exit action
-        exit_action = QAction("E&xit", self)
-        exit_action.setShortcut("Ctrl+Q")
-        exit_action.setStatusTip("Exit the application")
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-        
-        # Camera menu
-        camera_menu = menu_bar.addMenu("&Camera")
-        
-        # Start camera action
-        start_camera_action = QAction("&Start Camera", self)
-        start_camera_action.setStatusTip("Start camera feed")
-        start_camera_action.triggered.connect(self.start_camera)
-        camera_menu.addAction(start_camera_action)
-        
-        # Stop camera action
-        stop_camera_action = QAction("S&top Camera", self)
-        stop_camera_action.setStatusTip("Stop camera feed")
-        stop_camera_action.triggered.connect(self.stop_camera)
-        camera_menu.addAction(stop_camera_action)
-        
-        # Models menu
-        models_menu = menu_bar.addMenu("&Models")
-        
-        # Load model action
-        load_model_action = QAction("&Load Model", self)
-        load_model_action.setStatusTip("Load a computer vision model")
-        load_model_action.triggered.connect(self.load_model)
-        models_menu.addAction(load_model_action)
-        
-    def create_model_dock(self):
-        """Create the model selection dock widget"""
-        dock = QDockWidget("Model Selection", self)
-        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        
-        # Create widget for dock contents
-        model_widget = QWidget()
-        layout = QVBoxLayout(model_widget)
-        
-        # Model selection combo box
-        model_group = QGroupBox("Available Models")
+        # Model selection group
+        model_group = QGroupBox("Model Selection")
         model_layout = QVBoxLayout()
         
+        # Model dropdown
         self.model_combo = QComboBox()
-        self.model_combo.addItem("FasterRCNN")
-        self.model_combo.addItem("YOLOv8")
-        self.model_combo.addItem("YOLOv8-Segmentation")
-        
+        model_options = [
+            "FasterRCNN",
+            "YOLOv8",
+            "YOLOv8-Nano",
+            "YOLOv8-Medium", 
+            "YOLOv8-Large",
+            "YOLOv8-Seg",
+            "YOLOv8-Nano-Seg",
+            "YOLOv8-Medium-Seg",
+            "YOLOv8-Pose",
+            "DINOv2"
+        ]
+        self.model_combo.addItems(model_options)
+        model_layout.addWidget(QLabel("Model:"))
         model_layout.addWidget(self.model_combo)
         
-        # Load button
+        # Model status label
+        self.model_status_label = QLabel("Model: None")
+        model_layout.addWidget(self.model_status_label)
+        
+        # Load model button
         self.load_button = QPushButton("Load Model")
-        self.load_button.clicked.connect(self.load_model)
         model_layout.addWidget(self.load_button)
         
         model_group.setLayout(model_layout)
-        layout.addWidget(model_group)
+        control_layout.addWidget(model_group)
         
-        # Model status
-        status_group = QGroupBox("Model Status")
-        status_layout = QVBoxLayout()
-        
-        self.model_status_label = QLabel("No model loaded")
-        status_layout.addWidget(self.model_status_label)
-        
-        status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
-        
-        # Add spacer to push everything to the top
-        layout.addStretch()
-        
-        # Set the dock widget's content
-        dock.setWidget(model_widget)
-        self.addDockWidget(Qt.LeftDockWidgetArea, dock)
-        
-    def create_camera_dock(self):
-        """Create the camera control dock widget"""
-        dock = QDockWidget("Camera Control", self)
-        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        
-        # Create widget for dock contents
-        camera_widget = QWidget()
-        layout = QVBoxLayout(camera_widget)
-        
-        # Camera selection
-        camera_group = QGroupBox("Camera Selection")
+        # Camera control group
+        camera_group = QGroupBox("Camera Control")
         camera_layout = QVBoxLayout()
         
+        # Camera selection
         self.camera_combo = QComboBox()
-        self.camera_combo.addItem("Default Camera (0)")
-        self.camera_combo.addItem("Camera 1")
-        self.camera_combo.addItem("Camera 2")
-        
+        self.camera_combo.addItems(["Camera 0", "Camera 1", "Camera 2"])
+        camera_layout.addWidget(QLabel("Camera:"))
         camera_layout.addWidget(self.camera_combo)
         
-        # Start/Stop buttons
-        button_layout = QHBoxLayout()
-        
-        self.start_button = QPushButton("Start")
-        self.start_button.clicked.connect(self.start_camera)
-        button_layout.addWidget(self.start_button)
-        
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop_camera)
-        button_layout.addWidget(self.stop_button)
-        
-        camera_layout.addLayout(button_layout)
-        camera_group.setLayout(camera_layout)
-        layout.addWidget(camera_group)
-        
-        # Resolution settings
-        resolution_group = QGroupBox("Resolution")
-        resolution_layout = QVBoxLayout()
-        
+        # Resolution selection
         self.resolution_combo = QComboBox()
-        self.resolution_combo.addItem("640x480")
-        self.resolution_combo.addItem("1280x720")
-        self.resolution_combo.addItem("1920x1080")
+        self.resolution_combo.addItems(["640x480", "1280x720", "1920x1080"])
+        camera_layout.addWidget(QLabel("Resolution:"))
+        camera_layout.addWidget(self.resolution_combo)
         
-        resolution_layout.addWidget(self.resolution_combo)
-        resolution_group.setLayout(resolution_layout)
-        layout.addWidget(resolution_group)
+        # Start/stop buttons
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Camera")
+        self.stop_button = QPushButton("Stop Camera")
+        self.stop_button.setEnabled(False)
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+        camera_layout.addLayout(button_layout)
         
-        # Add spacer to push everything to the top
-        layout.addStretch()
+        camera_group.setLayout(camera_layout)
+        control_layout.addWidget(camera_group)
         
-        # Set the dock widget's content
-        dock.setWidget(camera_widget)
-        self.addDockWidget(Qt.LeftDockWidgetArea, dock)
+        # Detection parameters group
+        param_group = QGroupBox("Detection Parameters")
+        param_layout = QVBoxLayout()
         
-    def create_parameters_dock(self):
-        """Create the parameters dock widget"""
-        dock = QDockWidget("Model Parameters", self)
-        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        
-        # Create widget for dock contents
-        param_widget = QWidget()
-        layout = QVBoxLayout(param_widget)
-        
-        # Confidence threshold
-        conf_group = QGroupBox("Confidence Threshold")
-        conf_layout = QVBoxLayout()
-        
+        # Confidence threshold slider
+        conf_layout = QHBoxLayout()
+        conf_layout.addWidget(QLabel("Confidence:"))
         self.conf_slider = QSlider(Qt.Horizontal)
-        self.conf_slider.setMinimum(0)
-        self.conf_slider.setMaximum(100)
-        self.conf_slider.setValue(50)  # Default 0.5
-        conf_layout.addWidget(self.conf_slider)
-        
+        self.conf_slider.setRange(1, 100)
+        self.conf_slider.setValue(50)
         self.conf_label = QLabel("0.50")
+        conf_layout.addWidget(self.conf_slider)
         conf_layout.addWidget(self.conf_label)
-        
-        conf_group.setLayout(conf_layout)
-        layout.addWidget(conf_group)
+        param_layout.addLayout(conf_layout)
         
         # Visualization options
-        viz_group = QGroupBox("Visualization Options")
-        viz_layout = QVBoxLayout()
-        
-        self.show_boxes_check = QCheckBox("Show Bounding Boxes")
+        self.show_boxes_check = QCheckBox("Show Boxes")
         self.show_boxes_check.setChecked(True)
-        viz_layout.addWidget(self.show_boxes_check)
-        
         self.show_labels_check = QCheckBox("Show Labels")
         self.show_labels_check.setChecked(True)
-        viz_layout.addWidget(self.show_labels_check)
-        
         self.show_conf_check = QCheckBox("Show Confidence")
         self.show_conf_check.setChecked(True)
-        viz_layout.addWidget(self.show_conf_check)
         
-        viz_group.setLayout(viz_layout)
-        layout.addWidget(viz_group)
+        param_layout.addWidget(self.show_boxes_check)
+        param_layout.addWidget(self.show_labels_check)
+        param_layout.addWidget(self.show_conf_check)
         
-        # Add spacer to push everything to the top
-        layout.addStretch()
+        param_group.setLayout(param_layout)
+        control_layout.addWidget(param_group)
         
-        # Set the dock widget's content
-        dock.setWidget(param_widget)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        # Add YOLO-specific options group
+        yolo_group = QGroupBox("YOLO Options")
+        yolo_layout = QVBoxLayout()
+        
+        # IOU threshold
+        iou_layout = QHBoxLayout()
+        iou_layout.addWidget(QLabel("IOU Threshold:"))
+        self.iou_slider = QSlider(Qt.Horizontal)
+        self.iou_slider.setRange(1, 100)
+        self.iou_slider.setValue(45)
+        self.iou_label = QLabel("0.45")
+        iou_layout.addWidget(self.iou_slider)
+        iou_layout.addWidget(self.iou_label)
+        yolo_layout.addLayout(iou_layout)
+        
+        # Max detections
+        max_det_layout = QHBoxLayout()
+        max_det_layout.addWidget(QLabel("Max Detections:"))
+        self.max_det_spin = QSpinBox()
+        self.max_det_spin.setRange(1, 100)
+        self.max_det_spin.setValue(20)
+        max_det_layout.addWidget(self.max_det_spin)
+        yolo_layout.addLayout(max_det_layout)
+        
+        yolo_group.setLayout(yolo_layout)
+        control_layout.addWidget(yolo_group)
+        
+        # Add DINOv2-specific options group
+        dino_group = QGroupBox("DINOv2 Options")
+        dino_layout = QVBoxLayout()
+        
+        # Task selection
+        dino_layout.addWidget(QLabel("Task:"))
+        self.dino_task_combo = QComboBox()
+        self.dino_task_combo.addItems(["Feature Visualization", "Segmentation", "Depth Estimation"])
+        dino_layout.addWidget(self.dino_task_combo)
+        
+        # Feature visualization method
+        dino_layout.addWidget(QLabel("Feature Reduction:"))
+        self.dino_feature_method_combo = QComboBox()
+        self.dino_feature_method_combo.addItems(["PCA", "t-SNE"])
+        dino_layout.addWidget(self.dino_feature_method_combo)
+        
+        # Segmentation classes
+        segment_layout = QHBoxLayout()
+        segment_layout.addWidget(QLabel("Segment Classes:"))
+        self.dino_segment_spin = QSpinBox()
+        self.dino_segment_spin.setRange(2, 10)
+        self.dino_segment_spin.setValue(5)
+        segment_layout.addWidget(self.dino_segment_spin)
+        dino_layout.addLayout(segment_layout)
+        
+        dino_group.setLayout(dino_layout)
+        control_layout.addWidget(dino_group)
+        
+        # Add stretcher to push controls to the top
+        control_layout.addStretch()
+        
+        # Set control widget
+        control_dock.setWidget(control_widget)
+        
+        # Set central widget and add dock
+        self.setCentralWidget(central_widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, control_dock)
+        
+        # Add transforms panel as a dock widget
+        transforms_dock = QDockWidget("Image Transforms")
+        transforms_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetFloatable | 
+                                  QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        self.transforms_panel = TransformsPanel()
+        transforms_dock.setWidget(self.transforms_panel)
+        
+        # Add the transforms dock to the right side as well
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, transforms_dock)
         
     def connect_signals(self):
         """Set up signal/slot connections"""
         # Connect confidence slider to label
         self.conf_slider.valueChanged.connect(self.update_conf_label)
         
-        # Connect visualization checkboxes
-        self.show_boxes_check.toggled.connect(self.update_visualization_options)
-        self.show_labels_check.toggled.connect(self.update_visualization_options)
-        self.show_conf_check.toggled.connect(self.update_visualization_options)
+        # Connect visualization options
+        self.show_boxes_check.stateChanged.connect(self.update_visualization_options)
+        self.show_labels_check.stateChanged.connect(self.update_visualization_options)
+        self.show_conf_check.stateChanged.connect(self.update_visualization_options)
         
-        # Connect resolution combo box
+        # Connect camera buttons
+        self.start_button.clicked.connect(self.start_camera)
+        self.stop_button.clicked.connect(self.stop_camera)
+        
+        # Connect model loading
+        self.load_button.clicked.connect(self.load_model)
+        
+        # Connect resolution combo
         self.resolution_combo.currentIndexChanged.connect(self.update_resolution)
         
+        # Connect YOLO-specific controls
+        self.iou_slider.valueChanged.connect(self.update_iou_label)
+        self.max_det_spin.valueChanged.connect(self.update_max_detections)
+        
+        # Connect DINOv2-specific controls
+        self.dino_task_combo.currentIndexChanged.connect(self.update_dino_task)
+        self.dino_feature_method_combo.currentIndexChanged.connect(self.update_dino_feature_method)
+        self.dino_segment_spin.valueChanged.connect(self.update_dino_segment_classes)
+        
+        # Show/hide model-specific controls based on model selection
+        self.model_combo.currentTextChanged.connect(self.update_visible_controls)
+        
+        # Connect transforms panel signals
+        self.transforms_panel.transformsChanged.connect(self.update_visualization)
+        
+        # Initialize visible controls
+        self.update_visible_controls(self.model_combo.currentText())
+
     def start_camera(self):
         """Start the camera and processing thread"""
         if self.camera_thread is not None and self.camera_thread.isRunning():
@@ -385,8 +393,23 @@ class ComputerVisionApp(QMainWindow):
             self.last_gc_time = current_time
         
         try:
+            # Store the current frame for later use
+            self.current_frame = image
+            
+            # Apply transforms to the image (if any)
+            transformed_image = self.apply_transforms(image)
+            
+            # Process the frame with the current model
+            if self.model is not None:
+                # Pass both original and transformed frames to the model
+                processed_image = self.model.process_frame(image, transformed_image)
+                display_image = processed_image
+            else:
+                # No model loaded, just display the transformed image
+                display_image = transformed_image
+            
             # Scale the image to fit the label while maintaining aspect ratio
-            pixmap = QPixmap.fromImage(image)
+            pixmap = QPixmap.fromImage(display_image)
             scaled_pixmap = pixmap.scaled(self.video_label.size(), 
                                         Qt.AspectRatioMode.KeepAspectRatio, 
                                         Qt.TransformationMode.SmoothTransformation)
@@ -427,8 +450,22 @@ class ComputerVisionApp(QMainWindow):
                 self.model = FasterRCNNModel()
             elif model_name == "YOLOv8":
                 self.model = YOLOv8Model()
+            elif model_name == "YOLOv8-Nano":
+                self.model = YOLOv8NanoModel()
+            elif model_name == "YOLOv8-Medium":
+                self.model = YOLOv8MediumModel()
+            elif model_name == "YOLOv8-Large":
+                self.model = YOLOv8LargeModel()
             elif model_name == "YOLOv8-Seg":
                 self.model = YOLOv8SegmentationModel()
+            elif model_name == "YOLOv8-Nano-Seg":
+                self.model = YOLOv8NanoSegmentationModel()
+            elif model_name == "YOLOv8-Medium-Seg":
+                self.model = YOLOv8MediumSegmentationModel()
+            elif model_name == "YOLOv8-Pose":
+                self.model = YOLOv8PoseModel()
+            elif model_name == "DINOv2":
+                self.model = DINOv2Model()
             else:
                 self.update_status(f"Unknown model: {model_name}")
                 return
@@ -577,6 +614,103 @@ class ComputerVisionApp(QMainWindow):
         """Get the video label from the visualization widget"""
         return self.visualization.video_label
 
+    def update_iou_label(self, value):
+        """Update the IOU threshold label and model parameter"""
+        iou_value = value / 100.0
+        self.iou_label.setText(f"{iou_value:.2f}")
+        
+        # If we have a YOLO model, update its IOU threshold
+        if self.model is not None and hasattr(self.model, "iou_threshold"):
+            self.model.iou_threshold = iou_value
+            
+    def update_max_detections(self, value):
+        """Update the max detections parameter on the model"""
+        # If we have a YOLO model, update its max detections
+        if self.model is not None and hasattr(self.model, "max_detections"):
+            self.model.max_detections = value
+            
+    def update_dino_task(self, index):
+        """Update DINOv2 task"""
+        if self.model is not None and isinstance(self.model, DINOv2Model):
+            tasks = ['features', 'segmentation', 'depth']
+            task = tasks[index]
+            self.model.set_active_task(task)
+            
+    def update_dino_feature_method(self, index):
+        """Update DINOv2 feature visualization method"""
+        if self.model is not None and isinstance(self.model, DINOv2Model):
+            methods = ['pca', 'tsne']
+            method = methods[index]
+            self.model.set_feature_dim_reduction(method)
+            
+    def update_dino_segment_classes(self, value):
+        """Update DINOv2 segmentation classes"""
+        if self.model is not None and isinstance(self.model, DINOv2Model):
+            self.model.set_segment_classes(value)
+
+    def update_visible_controls(self, model_name):
+        """Show/hide controls based on model type"""
+        # Determine model type
+        is_yolo_model = "YOLO" in model_name
+        is_dino_model = "DINOv2" in model_name
+        
+        # Find the control dock widget
+        control_dock = None
+        for dock in self.findChildren(QDockWidget):
+            if dock.windowTitle() == "Controls":
+                control_dock = dock
+                break
+                
+        if control_dock:
+            control_widget = control_dock.widget()
+            
+            # Update visibility of control groups
+            for i in range(control_widget.layout().count()):
+                item = control_widget.layout().itemAt(i)
+                if item and item.widget() and isinstance(item.widget(), QGroupBox):
+                    group_box = item.widget()
+                    
+                    # Set visibility based on model type
+                    if group_box.title() == "YOLO Options":
+                        group_box.setVisible(is_yolo_model)
+                    elif group_box.title() == "DINOv2 Options":
+                        group_box.setVisible(is_dino_model)
+
+    def apply_transforms(self, image):
+        """Apply image transforms (if enabled) before processing with model"""
+        # Convert QImage to numpy for transformations
+        if hasattr(self, 'transforms_panel') and self.transforms_panel is not None:
+            # First convert to numpy
+            width = image.width()
+            height = image.height()
+            
+            ptr = image.constBits()
+            buf = memoryview(ptr).tobytes()
+            
+            # Reshape the buffer to match the image dimensions
+            if image.format() == QImage.Format_RGB888:
+                # 3 channels (RGB)
+                np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+            else:
+                # Convert to RGB format first
+                rgb_image = image.convertToFormat(QImage.Format_RGB888)
+                ptr = rgb_image.constBits()
+                buf = memoryview(ptr).tobytes()
+                np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+            
+            # Apply transformations
+            transformed_np = self.transforms_panel.apply_transforms(np_img)
+            
+            # Convert back to QImage
+            bytes_per_line = 3 * width
+            return QImage(transformed_np.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        
+        return image
+
+    def update_visualization(self):
+        """Update the visualization when transforms change"""
+        if hasattr(self, 'current_frame') and self.current_frame is not None:
+            self.update_frame(self.current_frame)
 
 def main():
     """Application entry point"""

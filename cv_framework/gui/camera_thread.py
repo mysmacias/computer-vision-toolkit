@@ -165,4 +165,32 @@ class CameraThread(QThread):
     
     def set_skip_frames(self, skip):
         """Set number of frames to skip (0 = process all frames)"""
-        self.skip_frames = max(0, skip) 
+        self.skip_frames = max(0, skip)
+    
+    def ensure_dimensions_compatible(self, frame, patch_size=None):
+        """Ensure frame dimensions are compatible with model requirements
+        
+        Args:
+            frame (numpy.ndarray): Input frame
+            patch_size (int, optional): Patch size for models like DINOv2.
+                                      If None, no special handling is done.
+        
+        Returns:
+            numpy.ndarray: Resized frame if needed
+        """
+        if frame is None or patch_size is None:
+            return frame
+            
+        h, w = frame.shape[:2]
+        
+        # For models that require dimensions to be multiples of patch_size
+        if patch_size > 1:
+            new_h = ((h // patch_size) * patch_size)
+            new_w = ((w // patch_size) * patch_size)
+            
+            # Only resize if dimensions need to change
+            if h != new_h or w != new_w:
+                frame = cv2.resize(frame, (new_w, new_h))
+                print(f"Resized frame from {w}x{h} to {new_w}x{new_h} to be compatible with patch size {patch_size}")
+                
+        return frame 
