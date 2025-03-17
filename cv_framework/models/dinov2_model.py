@@ -100,49 +100,23 @@ class DINOv2Model(VisionModel):
                 print(f"Error loading from torch hub: {hub_error}")
                 print("Attempting to load with timm as fallback...")
                 
-                # Try to use timm as a fallback
-                try:
-                    import timm
-                    import pkg_resources
-                    
-                    # Check timm version
-                    timm_version = pkg_resources.get_distribution("timm").version
-                    print(f"Using timm version: {timm_version}")
-                    
-                    model_name_map = {
-                        'dinov2_vits14': 'vit_small_patch14_dinov2',
-                        'dinov2_vitb14': 'vit_base_patch14_dinov2',
-                        'dinov2_vitl14': 'vit_large_patch14_dinov2',
-                        'dinov2_vitg14': 'vit_giant_patch14_dinov2',
-                    }
-                    
-                    # Get the corresponding timm model name
-                    timm_model_name = model_name_map.get(self.model_name)
-                    
-                    if not timm_model_name:
-                        raise ValueError(f"Unknown DINOv2 model: {self.model_name}")
-                    
-                    # Check if the model is available in this timm version
-                    available_models = timm.list_models('*dinov2*')
-                    if timm_model_name not in available_models:
-                        print(f"Model {timm_model_name} not found in timm {timm_version}")
-                        print(f"Available DINOv2 models in timm: {available_models}")
-                        raise ValueError(f"Model {timm_model_name} not available in installed timm version")
-                    
-                    # If available, load the model
-                    model = timm.create_model(timm_model_name, pretrained=True)
-                except ImportError as e:
-                    print(f"Error importing timm: {e}")
-                    raise RuntimeError("Both torch hub and timm failed to load the model. Please install timm.")
-                except Exception as e:
-                    print(f"Error loading model with timm: {e}")
-                    raise
+                # Try to use timm as a fallback 
+                import timm
+                model_name_map = {
+                    'dinov2_vits14': 'vit_small_patch14_dinov2',
+                    'dinov2_vitb14': 'vit_base_patch14_dinov2',
+                    'dinov2_vitl14': 'vit_large_patch14_dinov2',
+                    'dinov2_vitg14': 'vit_giant_patch14_dinov2',
+                }
+                timm_name = model_name_map.get(self.model_name)
+                if timm_name is None:
+                    raise ValueError(f"No timm equivalent for {self.model_name}")
                 
-                self.model = model
+                self.model = timm.create_model(timm_name, pretrained=True)
                 self.model.to(self.device)
                 self.model.eval()
                 
-                print(f"DINOv2 model loaded successfully using timm: {timm_model_name}")
+                print(f"DINOv2 model loaded successfully using timm: {timm_name}")
                 return True
         except Exception as e:
             print(f"Error loading DINOv2 model: {e}")
