@@ -106,10 +106,22 @@ class VisionModel:
             bool: True if successful, False otherwise
         """
         print(f"Initializing camera (index: {camera_idx})...")
-        self.cap = cv2.VideoCapture(camera_idx)
+        
+        # Try different camera indices if the first one fails
+        for idx in [camera_idx, 0, 1]:
+            self.cap = cv2.VideoCapture(idx)
+            if self.cap.isOpened():
+                print(f"Successfully opened camera at index {idx}")
+                break
         
         if not self.cap.isOpened():
-            print("Error: Could not open camera.")
+            print("Error: Could not open camera. Please check if:")
+            print("1. Your webcam is properly connected")
+            print("2. You have the necessary permissions")
+            print("3. If using WSL, make sure you have:")
+            print("   - Installed v4l-utils: sudo apt install v4l-utils")
+            print("   - Created symbolic link: sudo ln -s /dev/video0 /dev/video1")
+            print("   - Updated WSL: wsl --update")
             return False
         
         # Get camera properties
