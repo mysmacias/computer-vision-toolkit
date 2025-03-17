@@ -399,23 +399,25 @@ class ComputerVisionApp(QMainWindow):
             # Apply transforms to the image (if any)
             transformed_image = self.apply_transforms(image)
             
-            # Process the frame with the current model
+            # Process both frames with the current model
             if self.model is not None:
-                # Pass both original and transformed frames to the model
-                processed_image = self.model.process_frame(image, transformed_image)
-                display_image = processed_image
+                # Process original frame
+                original_processed = self.model.process_frame(image)
+                
+                # Process transformed frame
+                transformed_processed = self.model.process_frame(image, transformed_image)
+                
+                # Use the processed images for display
+                display_original = original_processed
+                display_transformed = transformed_processed
             else:
-                # No model loaded, just display the transformed image
-                display_image = transformed_image
+                # No model loaded, just display the original and transformed images
+                display_original = image
+                display_transformed = transformed_image
             
-            # Scale the image to fit the label while maintaining aspect ratio
-            pixmap = QPixmap.fromImage(display_image)
-            scaled_pixmap = pixmap.scaled(self.video_label.size(), 
-                                        Qt.AspectRatioMode.KeepAspectRatio, 
-                                        Qt.TransformationMode.SmoothTransformation)
-            
-            # Update the label with the new image
-            self.video_label.setPixmap(scaled_pixmap)
+            # Update both displays
+            self.visualization.update_frame(display_original)
+            self.visualization.update_transformed_frame(display_transformed)
             
         except Exception as e:
             self.update_status(f"Error updating frame: {str(e)}")
@@ -600,20 +602,13 @@ class ComputerVisionApp(QMainWindow):
         
     def reset_display(self, message=None):
         """Reset the display to a blank state with optional message"""
-        # Clear the video label
-        self.video_label.clear()
+        # Clear both video labels
+        self.visualization.clear()
         
         # Show message if provided
         if message:
             self.update_status(message)
             
-    # Add missing video_label property which should have been part of the VisualizationWidget
-    # but was referenced directly in update_frame
-    @property
-    def video_label(self):
-        """Get the video label from the visualization widget"""
-        return self.visualization.video_label
-
     def update_iou_label(self, value):
         """Update the IOU threshold label and model parameter"""
         iou_value = value / 100.0
