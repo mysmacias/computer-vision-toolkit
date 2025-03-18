@@ -54,6 +54,13 @@ class ComputerVisionApp(QMainWindow):
         self.is_running = False
         self.last_gc_time = time.time()  # For periodic garbage collection
         
+        # Performance optimization variables
+        self.frame_count = 0
+        self.transform_every_n_frames = 2  # Only apply transforms every N frames
+        self.last_transform_params = None
+        self.cached_transformed_image = None
+        self.high_performance_mode = True  # Default to high performance mode
+        
         # Set up the UI
         self.setup_ui()
         
@@ -75,6 +82,16 @@ class ComputerVisionApp(QMainWindow):
         # Create video display area
         self.visualization = VisualizationWidget()
         main_layout.addWidget(self.visualization)
+        
+        # Create transforms panel as a dock widget on the left
+        transforms_dock = QDockWidget("Image Transforms")
+        transforms_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetFloatable | 
+                                  QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        self.transforms_panel = TransformsPanel()
+        transforms_dock.setWidget(self.transforms_panel)
+        
+        # Add the transforms dock to the LEFT side
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, transforms_dock)
         
         # Set up control panel on the right
         control_dock = QDockWidget("Controls")
@@ -140,6 +157,16 @@ class ComputerVisionApp(QMainWindow):
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
         camera_layout.addLayout(button_layout)
+        
+        # Toggle display mode button
+        self.toggle_display_button = QPushButton("Switch to Single Display")
+        camera_layout.addWidget(self.toggle_display_button)
+        
+        # Add performance mode toggle
+        self.performance_mode_check = QCheckBox("High Performance Mode")
+        self.performance_mode_check.setChecked(self.high_performance_mode)
+        self.performance_mode_check.setToolTip("Optimize for performance at the cost of some visual quality")
+        camera_layout.addWidget(self.performance_mode_check)
         
         camera_group.setLayout(camera_layout)
         control_layout.addWidget(camera_group)
@@ -239,16 +266,6 @@ class ComputerVisionApp(QMainWindow):
         self.setCentralWidget(central_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, control_dock)
         
-        # Add transforms panel as a dock widget
-        transforms_dock = QDockWidget("Image Transforms")
-        transforms_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetFloatable | 
-                                  QDockWidget.DockWidgetFeature.DockWidgetMovable)
-        self.transforms_panel = TransformsPanel()
-        transforms_dock.setWidget(self.transforms_panel)
-        
-        # Add the transforms dock to the right side as well
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, transforms_dock)
-        
     def connect_signals(self):
         """Set up signal/slot connections"""
         # Connect confidence slider to label
@@ -262,6 +279,12 @@ class ComputerVisionApp(QMainWindow):
         # Connect camera buttons
         self.start_button.clicked.connect(self.start_camera)
         self.stop_button.clicked.connect(self.stop_camera)
+        
+        # Connect toggle display button
+        self.toggle_display_button.clicked.connect(self.toggle_display_mode)
+        
+        # Connect performance mode checkbox
+        self.performance_mode_check.stateChanged.connect(self.toggle_performance_mode)
         
         # Connect model loading
         self.load_button.clicked.connect(self.load_model)
@@ -399,25 +422,48 @@ class ComputerVisionApp(QMainWindow):
             # Apply transforms to the image (if any)
             transformed_image = self.apply_transforms(image)
             
-            # Process both frames with the current model
+            # In high performance mode, only process dual feed when necessary
+            should_process_original = True
+            if self.high_performance_mode and self.visualization.dual_mode:
+                # For dual mode, we can skip some processing of the original frame
+                # to maintain performance
+                self.frame_count += 1
+                if self.frame_count % 2 != 0:  # Process original every other frame
+                    should_process_original = False
+            
+            # Process frames with the current model
             if self.model is not None:
-                # Process original frame
-                original_processed = self.model.process_frame(image)
+                # Process original frame if needed
+                if should_process_original:
+                    original_processed = self.model.process_frame(image)
+                    display_original = original_processed
+                else:
+                    # Use the last processed frame for original display
+                    display_original = getattr(self, 'last_original_processed', image)
                 
                 # Process transformed frame
-                transformed_processed = self.model.process_frame(image, transformed_image)
-                
-                # Use the processed images for display
-                display_original = original_processed
+                transformed_processed = self.model.process_frame(transformed_image)
                 display_transformed = transformed_processed
+                
+                # Store for future frame skipping
+                self.last_original_processed = display_original
             else:
                 # No model loaded, just display the original and transformed images
                 display_original = image
                 display_transformed = transformed_image
             
-            # Update both displays
-            self.visualization.update_frame(display_original)
-            self.visualization.update_transformed_frame(display_transformed)
+            # Update displays based on current mode
+            if self.visualization.dual_mode:
+                # In dual mode, update both displays
+                if should_process_original or not self.high_performance_mode:
+                    self.visualization.update_frame(display_original)
+                self.visualization.update_transformed_frame(display_transformed)
+            else:
+                # In single mode, only update the visible display
+                if self.visualization.video_label.isVisible():
+                    self.visualization.update_frame(display_original)
+                else:
+                    self.visualization.update_transformed_frame(display_transformed)
             
         except Exception as e:
             self.update_status(f"Error updating frame: {str(e)}")
@@ -673,39 +719,117 @@ class ComputerVisionApp(QMainWindow):
 
     def apply_transforms(self, image):
         """Apply image transforms (if enabled) before processing with model"""
-        # Convert QImage to numpy for transformations
-        if hasattr(self, 'transforms_panel') and self.transforms_panel is not None:
-            # First convert to numpy
-            width = image.width()
-            height = image.height()
+        # Check if transform panel exists
+        if not hasattr(self, 'transforms_panel') or self.transforms_panel is None:
+            return image
             
-            ptr = image.constBits()
-            buf = memoryview(ptr).tobytes()
+        # Performance optimizations
+        if self.high_performance_mode:
+            # Skip frames to improve performance
+            self.frame_count += 1
+            if self.frame_count % self.transform_every_n_frames != 0:
+                # Use cached transformed image if available
+                if self.cached_transformed_image is not None:
+                    return self.cached_transformed_image
+                    
+        # Check if any transform is actually enabled
+        if not self.transforms_panel.has_active_transforms():
+            return image
             
-            # Reshape the buffer to match the image dimensions
-            if image.format() == QImage.Format_RGB888:
-                # 3 channels (RGB)
-                np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
-            else:
-                # Convert to RGB format first
-                rgb_image = image.convertToFormat(QImage.Format_RGB888)
-                ptr = rgb_image.constBits()
-                buf = memoryview(ptr).tobytes()
-                np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
-            
-            # Apply transformations
-            transformed_np = self.transforms_panel.apply_transforms(np_img)
-            
-            # Convert back to QImage
-            bytes_per_line = 3 * width
-            return QImage(transformed_np.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        # Get current transform parameters
+        current_params = self.transforms_panel.get_transform_params()
         
-        return image
+        # Use cached image if transform parameters haven't changed
+        if (self.cached_transformed_image is not None and 
+            self.last_transform_params == current_params and
+            self.high_performance_mode):
+            return self.cached_transformed_image
+        
+        # Store new parameters
+        self.last_transform_params = current_params
+            
+        # Convert QImage to numpy for transformations
+        width = image.width()
+        height = image.height()
+        
+        # In high performance mode, downscale before processing
+        scale_factor = 0.5 if self.high_performance_mode else 1.0
+        if scale_factor < 1.0:
+            width_scaled = int(width * scale_factor)
+            height_scaled = int(height * scale_factor)
+            # Scale down the image before processing
+            scaled_image = image.scaled(width_scaled, height_scaled, 
+                                       Qt.AspectRatioMode.IgnoreAspectRatio,
+                                       Qt.TransformationMode.FastTransformation)
+            ptr = scaled_image.constBits()
+            width = width_scaled
+            height = height_scaled
+        else:
+            ptr = image.constBits()
+            
+        buf = memoryview(ptr).tobytes()
+        
+        # Reshape the buffer to match the image dimensions
+        if image.format() == QImage.Format_RGB888:
+            # 3 channels (RGB)
+            np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+        else:
+            # Convert to RGB format first
+            rgb_image = image.convertToFormat(QImage.Format_RGB888)
+            if scale_factor < 1.0:
+                rgb_image = rgb_image.scaled(width_scaled, height_scaled, 
+                                           Qt.AspectRatioMode.IgnoreAspectRatio,
+                                           Qt.TransformationMode.FastTransformation)
+            ptr = rgb_image.constBits()
+            buf = memoryview(ptr).tobytes()
+            np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+        
+        # Apply transformations
+        transformed_np = self.transforms_panel.apply_transforms(np_img)
+        
+        # Convert back to QImage
+        bytes_per_line = 3 * width
+        transformed_image = QImage(transformed_np.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        
+        # If in high performance mode, scale back up to original size
+        if scale_factor < 1.0:
+            transformed_image = transformed_image.scaled(
+                image.width(), image.height(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            
+        # Cache the transformed image
+        self.cached_transformed_image = transformed_image
+        
+        return transformed_image
 
     def update_visualization(self):
         """Update the visualization when transforms change"""
         if hasattr(self, 'current_frame') and self.current_frame is not None:
             self.update_frame(self.current_frame)
+
+    def toggle_display_mode(self):
+        """Toggle between single and dual display modes"""
+        # Call the visualization widget's toggle method
+        self.visualization.toggle_display_mode()
+        
+        # Update button text according to current mode
+        if self.visualization.dual_mode:
+            self.toggle_display_button.setText("Switch to Single Display")
+            self.update_status("Switched to dual display mode")
+        else:
+            self.toggle_display_button.setText("Switch to Dual Display")
+            self.update_status("Switched to single display mode")
+            
+        # Force update of the display if there's a current frame
+        if hasattr(self, 'current_frame') and self.current_frame is not None:
+            self.update_frame(self.current_frame)
+
+    def toggle_performance_mode(self):
+        """Toggle the performance mode"""
+        self.high_performance_mode = not self.high_performance_mode
+        self.performance_mode_check.setChecked(self.high_performance_mode)
+        self.update_status(f"Performance mode: {'High' if self.high_performance_mode else 'Low'}")
 
 def main():
     """Application entry point"""

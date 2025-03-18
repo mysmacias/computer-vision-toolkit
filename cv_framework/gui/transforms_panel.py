@@ -197,8 +197,65 @@ class TransformsPanel(QWidget):
         self.transformsChanged.emit()
         
     def apply_transforms(self, image):
-        """Apply all enabled transforms to an image"""
-        return self.transform_manager.apply_transforms(image)
+        """Apply all active transforms to the image
+        
+        Args:
+            image (numpy.ndarray): Input image
+            
+        Returns:
+            numpy.ndarray: Transformed image
+        """
+        # Use the appropriate implementation based on what's available
+        if hasattr(self, 'transform_manager'):
+            # If using transform_manager
+            return self.transform_manager.apply_transforms(image)
+        elif hasattr(self, 'transform_sliders'):
+            # If using transform_sliders directly
+            result = image.copy()
+            # Apply each active transform
+            for transform_slider in self.transform_sliders:
+                if transform_slider.enabled:
+                    strength = transform_slider.get_value()
+                    result = transform_slider.apply_transform(result, strength)
+            return result
+        
+        # If neither is available, return the image unchanged
+        return image
+        
+    def has_active_transforms(self):
+        """Check if any transforms are currently active
+        
+        Returns:
+            bool: True if any transforms are enabled with non-zero strength
+        """
+        # Get the transform manager and check if it has any active transforms
+        if hasattr(self, 'transform_manager'):
+            # If using transform_manager
+            return self.transform_manager.has_active_transforms()
+        elif hasattr(self, 'transform_sliders'):
+            # If using transform_sliders directly
+            for transform_slider in self.transform_sliders:
+                if transform_slider.enabled and transform_slider.get_value() > 0:
+                    return True
+        return False
+        
+    def get_transform_params(self):
+        """Get current transform parameters for caching
+        
+        Returns:
+            tuple: Tuple of (transform_name, enabled, strength) for each transform
+        """
+        # Get the transform parameters based on implementation
+        if hasattr(self, 'transform_manager'):
+            # If using transform_manager
+            return self.transform_manager.get_transform_params()
+        elif hasattr(self, 'transform_sliders'):
+            # If using transform_sliders directly
+            return tuple(
+                (slider.name, slider.enabled, slider.get_value())
+                for slider in self.transform_sliders
+            )
+        return tuple()
         
     def get_transform_manager(self):
         """Get the transform manager"""

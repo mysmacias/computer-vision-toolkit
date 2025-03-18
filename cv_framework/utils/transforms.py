@@ -266,4 +266,26 @@ class TransformManager:
         """Reset all transforms to default values"""
         for transform in self.transforms.values():
             transform.set_strength(0.0)
-            transform.set_enabled(False) 
+            transform.set_enabled(False)
+            
+    def has_active_transforms(self):
+        """Check if any transforms are currently active
+        
+        Returns:
+            bool: True if any transforms are enabled with non-zero strength
+        """
+        for transform in self.transforms.values():
+            if transform.enabled and transform.strength > 0:
+                return True
+        return False
+        
+    def get_transform_params(self):
+        """Get current transform parameters for caching
+        
+        Returns:
+            tuple: Tuple of (transform_name, enabled, strength) for each transform
+        """
+        return tuple(
+            (name, transform.enabled, transform.strength)
+            for name, transform in self.transforms.items()
+        ) 

@@ -54,6 +54,9 @@ class VisualizationWidget(QWidget):
             "show_conf": True
         }
         
+        # Set dual display mode by default
+        self.dual_mode = True
+        
     def set_options(self, options):
         """Set visualization options
         
@@ -101,6 +104,19 @@ class VisualizationWidget(QWidget):
         
         # Update the label with the new image
         self.transformed_video_label.setPixmap(scaled_pixmap)
+        
+    def toggle_display_mode(self):
+        """Toggle between single and dual display modes"""
+        self.dual_mode = not self.dual_mode
+        
+        if self.dual_mode:
+            # Show both displays side by side
+            self.video_label.setVisible(True)
+            self.transformed_video_label.setVisible(True)
+        else:
+            # Only show the transformed display
+            self.video_label.setVisible(False)
+            self.transformed_video_label.setVisible(True)
         
     def clear(self):
         """Clear the display"""
