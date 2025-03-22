@@ -26,6 +26,18 @@ cd cv-framework
 pip install -r requirements.txt
 ```
 
+### Activating the Virtual Environment
+
+#### Linux/macOS
+```bash
+source cv/bin/activate
+```
+
+#### Windows (PowerShell)
+```powershell
+.\cv\Scripts\Activate.ps1
+```
+
 ## Requirements
 
 - Python 3.7+
