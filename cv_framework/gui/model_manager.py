@@ -49,6 +49,34 @@ class ModelInterface:
         
         # This should be overridden by subclasses
         raise NotImplementedError("Subclasses must implement process_frame()")
+
+    def process_frame_direct(self, frame_np):
+        """Process a frame directly as numpy array with the model
+        
+        This is a more efficient processing path that avoids QImage conversions
+        
+        Args:
+            frame_np (numpy.ndarray): Input frame as RGB numpy array
+            
+        Returns:
+            numpy.ndarray: Processed frame with detections as RGB numpy array
+        """
+        # Default implementation converts to QImage and back
+        # Subclasses should override this with a direct implementation
+        try:
+            # Convert numpy array to QImage
+            h, w, ch = frame_np.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(frame_np.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Process with QImage implementation
+            result_qimage = self.process_frame(qt_image)
+            
+            # Convert back to numpy array
+            return self.to_numpy(result_qimage)
+        except Exception as e:
+            print(f"Error in process_frame_direct: {str(e)}")
+            return frame_np
         
     def set_threshold(self, threshold):
         """Set the confidence threshold
@@ -142,6 +170,13 @@ class FasterRCNNModel(ModelInterface):
     
     def __init__(self):
         super().__init__()
+        self.model = None
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.confidence_threshold = 0.5
+        self.iou_threshold = 0.45  # IoU threshold for NMS
+        self.last_inference_time = 0
+        self.fps_alpha = 0.9  # For smoothing FPS calculation
+        self.current_fps = 0
         self.coco_names = [
             'background', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
             'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
@@ -157,19 +192,36 @@ class FasterRCNNModel(ModelInterface):
             'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
         ]
         self.last_inference_time = 0
-        self.fps_alpha = 0.9  # For FPS smoothing
+        self.fps_alpha = 0.9  # For smoothing FPS calculation
         self.current_fps = 0
+        
+        # Hardware acceleration settings
+        self.use_amp = torch.cuda.is_available() and hasattr(torch.cuda, 'amp')
+        self.optimized_inference = True
+        self.trace_model = False  # Whether to use torch.jit.trace for optimization
+        self.traced_model = None  # Store the traced model
         
     def load(self):
         """Load the FasterRCNN model"""
         try:
             import torchvision
             from torchvision import models
+            from torchvision.ops import nms
             
-            # Determine device (CPU or CUDA)
-            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            print(f"Using device: {self.device}")
-            
+            # Try using jit compiled model if available
+            if self.trace_model and torch.cuda.is_available():
+                try:
+                    jit_model_path = os.path.join(os.path.dirname(__file__), "fasterrcnn_jit.pt")
+                    if os.path.exists(jit_model_path):
+                        print(f"Loading JIT-compiled FasterRCNN model from {jit_model_path}")
+                        self.traced_model = torch.jit.load(jit_model_path)
+                        self.traced_model.eval().to(self.device)
+                        print("Successfully loaded JIT-compiled model")
+                        return True
+                except Exception as e:
+                    print(f"Failed to load JIT model: {e}")
+                    self.traced_model = None
+                    
             # Load a more efficient model for inference
             try:
                 # For newer torchvision versions
@@ -186,11 +238,36 @@ class FasterRCNNModel(ModelInterface):
             # Set model to evaluation mode
             self.model.eval()
             
+            # Optimize model
+            if self.optimized_inference:
+                # Use half-precision for faster inference
+                if self.device == "cuda:0" and hasattr(torch, 'cuda'):
+                    # Enable TF32 precision on Ampere or later GPUs
+                    if hasattr(torch.backends.cuda, 'matmul') and hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                    if hasattr(torch.backends.cudnn, 'allow_tf32'):
+                        torch.backends.cudnn.allow_tf32 = True
+                    
+                    # Enable torch.jit for faster execution
+                    if self.trace_model and self.traced_model is None:
+                        try:
+                            # Create a sample input for tracing
+                            dummy_input = torch.rand(1, 3, 640, 480).to(self.device)
+                            # Trace the model
+                            self.traced_model = torch.jit.trace(self.model, [dummy_input])
+                            # Save the traced model
+                            jit_model_path = os.path.join(os.path.dirname(__file__), "fasterrcnn_jit.pt")
+                            torch.jit.save(self.traced_model, jit_model_path)
+                            print(f"JIT model saved to {jit_model_path}")
+                        except Exception as e:
+                            print(f"Failed to trace model: {e}")
+                            self.traced_model = None
+            
             # Optimize for inference
             if self.device == "cuda:0":
                 # Optimize for GPU inference if available
                 if hasattr(torch, 'cuda') and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
-                    print("CUDA optimization enabled")
+                    print("CUDA optimization enabled with AMP")
                 else:
                     print("CUDA available but amp module not found")
             
@@ -202,7 +279,187 @@ class FasterRCNNModel(ModelInterface):
             import traceback
             traceback.print_exc()
             return False
+            
+    def preprocess_tensor(self, image_np):
+        """Preprocess numpy array to tensor for model input
         
+        Args:
+            image_np (numpy.ndarray): RGB image as numpy array
+            
+        Returns:
+            torch.Tensor: Preprocessed tensor ready for model input
+        """
+        # Ensure the image is contiguous and float32
+        if not image_np.flags['C_CONTIGUOUS']:
+            image_np = np.ascontiguousarray(image_np)
+            
+        # Convert to tensor more efficiently by avoiding unnecessary copy
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+        image_tensor = image_tensor.unsqueeze(0)  # Add batch dimension
+        
+        # Move to device
+        if self.device != "cpu":
+            image_tensor = image_tensor.to(self.device, non_blocking=True)
+            
+        return image_tensor
+            
+    def process_frame_direct(self, image_np):
+        """Process a frame directly with FasterRCNN
+        
+        Args:
+            image_np (numpy.ndarray): RGB image as numpy array
+            
+        Returns:
+            numpy.ndarray: Processed image with detections
+        """
+        if self.model is None:
+            return image_np
+            
+        try:
+            # Create a copy for drawing
+            output_image = image_np.copy()
+            
+            # Resize image for faster inference
+            height, width = image_np.shape[:2]
+            max_size = 640  # Maximum size for faster inference
+            
+            # Calculate scaling factor
+            scale = 1.0
+            if max(height, width) > max_size:
+                scale = max_size / max(height, width)
+                resize_width = int(width * scale)
+                resize_height = int(height * scale)
+                
+                # Resize image for inference (smaller is faster)
+                small_image = cv2.resize(image_np, (resize_width, resize_height), 
+                                        interpolation=cv2.INTER_LINEAR)
+            else:
+                small_image = image_np
+            
+            # Preprocess image to tensor
+            image_tensor = self.preprocess_tensor(small_image)
+            
+            # Run inference with optimization for GPU
+            with torch.no_grad():
+                start_time = time.time()
+                
+                if self.use_amp and self.device == "cuda:0":
+                    with torch.cuda.amp.autocast():
+                        # Use traced model if available for faster inference
+                        if self.traced_model is not None:
+                            predictions = self.traced_model(image_tensor)
+                        else:
+                            predictions = self.model(image_tensor)
+                else:
+                    # Use traced model if available
+                    if self.traced_model is not None:
+                        predictions = self.traced_model(image_tensor)
+                    else:
+                        predictions = self.model(image_tensor)
+                    
+                current_time = time.time() - start_time
+                
+                # Smooth FPS calculation
+                if self.last_inference_time > 0:
+                    self.current_fps = self.fps_alpha * self.current_fps + (1 - self.fps_alpha) * (1.0 / current_time)
+                else:
+                    self.current_fps = 1.0 / current_time
+                self.last_inference_time = current_time
+            
+            # Process predictions - extract data from tensors
+            boxes = predictions[0]['boxes'].cpu().numpy()
+            scores = predictions[0]['scores'].cpu().numpy()
+            labels = predictions[0]['labels'].cpu().numpy()
+            
+            # Filter by confidence threshold
+            keep = scores >= self.confidence_threshold
+            boxes = boxes[keep]
+            scores = scores[keep]
+            labels = labels[keep]
+            
+            # Rescale boxes to original image size if needed
+            if scale != 1.0:
+                boxes = boxes / scale
+            
+            # Apply custom NMS per class for better filtering
+            final_boxes = []
+            final_scores = []
+            final_labels = []
+            
+            # Process each class separately
+            unique_labels = np.unique(labels)
+            for class_id in unique_labels:
+                # Get indices for this class
+                class_indices = np.where(labels == class_id)[0]
+                
+                if len(class_indices) > 1:  # Only apply NMS if we have multiple detections of same class
+                    class_boxes = boxes[class_indices]
+                    class_scores = scores[class_indices]
+                    
+                    # Convert to torch tensors for NMS
+                    boxes_tensor = torch.from_numpy(class_boxes).float()
+                    scores_tensor = torch.from_numpy(class_scores).float()
+                    
+                    # Apply NMS using torchvision
+                    from torchvision.ops import nms
+                    keep_indices = nms(boxes_tensor, scores_tensor, self.iou_threshold)
+                    keep_indices = keep_indices.cpu().numpy()
+                    
+                    # Keep the selected indices
+                    final_boxes.extend(class_boxes[keep_indices])
+                    final_scores.extend(class_scores[keep_indices])
+                    final_labels.extend([class_id] * len(keep_indices))
+                else:
+                    # If only one detection, keep it
+                    final_boxes.extend(boxes[class_indices])
+                    final_scores.extend(scores[class_indices])
+                    final_labels.extend(labels[class_indices])
+            
+            # Convert lists back to numpy arrays
+            final_boxes = np.array(final_boxes) if final_boxes else np.empty((0, 4))
+            final_scores = np.array(final_scores) if final_scores else np.empty(0)
+            final_labels = np.array(final_labels) if final_labels else np.empty(0)
+            
+            # Draw boxes on the output image - optimized drawing
+            for box, score, label in zip(final_boxes, final_scores, final_labels):
+                # Get integer coordinates
+                x1, y1, x2, y2 = map(int, box)
+                
+                # Get label name
+                label_name = self.coco_names[label] if label < len(self.coco_names) else f"Class {label}"
+                
+                # Draw box efficiently - bright green for visibility
+                cv2.rectangle(output_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Draw background for text
+                text = f"{label_name}: {score:.2f}"
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                cv2.rectangle(output_image, (x1, y1 - text_size[1] - 10), (x1 + text_size[0], y1), (0, 255, 0), -1)
+                
+                # Draw label and score in black text
+                cv2.putText(output_image, text, (x1, y1 - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            
+            # Draw FPS and detection count
+            detection_count = len(final_boxes)
+            status_text = f"FPS: {self.current_fps:.1f} | Det: {detection_count}"
+            
+            # Draw background for status text
+            status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.rectangle(output_image, (5, 5), (5 + status_size[0] + 10, 5 + status_size[1] + 10), (0, 0, 0), -1)
+            
+            # Draw status text
+            cv2.putText(output_image, status_text, (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            return output_image
+            
+        except Exception as e:
+            print(f"Error processing frame directly: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return image_np
+
     def process_frame(self, frame, transformed_frame=None):
         """Process a frame with FasterRCNN
         
@@ -221,103 +478,14 @@ class FasterRCNNModel(ModelInterface):
             # Use transformed frame if provided, otherwise use original
             image_to_process = transformed_frame if transformed_frame is not None else frame
             
-            # Convert QImage to numpy array
+            # Convert QImage to numpy array - direct path for better performance
             image_np = self.to_numpy(image_to_process)
             
-            # Create a copy for drawing
-            output_image = image_np.copy()
-            
-            # Resize image for faster inference
-            height, width = image_np.shape[:2]
-            max_size = 640  # Maximum size for faster inference
-            
-            # Calculate scaling factor
-            scale = 1.0
-            if max(height, width) > max_size:
-                scale = max_size / max(height, width)
-                resize_width = int(width * scale)
-                resize_height = int(height * scale)
-                
-                # Resize image for inference (smaller is faster)
-                small_image = cv2.resize(image_np, (resize_width, resize_height))
-            else:
-                small_image = image_np
-            
-            # Preprocess image for PyTorch
-            image_tensor = torch.from_numpy(small_image).permute(2, 0, 1).float() / 255.0
-            image_tensor = image_tensor.unsqueeze(0)  # Add batch dimension
-            
-            # Move tensor to correct device
-            image_tensor = image_tensor.to(self.device)
-            
-            # Run inference with optimization for GPU
-            with torch.no_grad():
-                start_time = time.time()
-                
-                if self.device == "cuda:0" and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
-                    with torch.cuda.amp.autocast():
-                        predictions = self.model(image_tensor)
-                else:
-                    predictions = self.model(image_tensor)
-                    
-                current_time = time.time() - start_time
-                
-                # Smooth FPS calculation
-                if self.last_inference_time > 0:
-                    self.current_fps = self.fps_alpha * self.current_fps + (1 - self.fps_alpha) * (1.0 / current_time)
-                else:
-                    self.current_fps = 1.0 / current_time
-                self.last_inference_time = current_time
-            
-            # Process predictions
-            boxes = predictions[0]['boxes'].cpu().numpy()
-            scores = predictions[0]['scores'].cpu().numpy()
-            labels = predictions[0]['labels'].cpu().numpy()
-            
-            # Filter by confidence threshold
-            keep = scores >= self.confidence_threshold
-            boxes = boxes[keep]
-            scores = scores[keep]
-            labels = labels[keep]
-            
-            # Rescale boxes to original image size if needed
-            if scale != 1.0:
-                boxes = boxes / scale
-            
-            # Draw boxes on the output image
-            for box, score, label in zip(boxes, scores, labels):
-                # Convert box coordinates to integers
-                x1, y1, x2, y2 = map(int, box)
-                
-                # Get label name
-                label_name = self.coco_names[label] if label < len(self.coco_names) else f"Class {label}"
-                
-                # Draw box - bright green for visibility
-                cv2.rectangle(output_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # Draw background for text
-                text = f"{label_name}: {score:.2f}"
-                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
-                cv2.rectangle(output_image, (x1, y1 - text_size[1] - 10), (x1 + text_size[0], y1), (0, 255, 0), -1)
-                
-                # Draw label and score in black text
-                cv2.putText(output_image, text, (x1, y1 - 5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-            
-            # Draw FPS and detection count
-            detection_count = len(boxes)
-            status_text = f"FPS: {self.current_fps:.1f} | Detections: {detection_count}"
-            
-            # Draw background for status text
-            status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.rectangle(output_image, (5, 5), (5 + status_size[0] + 10, 5 + status_size[1] + 10), (0, 0, 0), -1)
-            
-            # Draw status text
-            cv2.putText(output_image, status_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Process using the optimized direct implementation
+            result_np = self.process_frame_direct(image_np)
             
             # Convert back to QImage
-            return self.to_qimage(output_image)
+            return self.to_qimage(result_np)
             
         except Exception as e:
             print(f"Error processing frame: {str(e)}")

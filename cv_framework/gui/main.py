@@ -61,8 +61,17 @@ class ComputerVisionApp(QMainWindow):
         self.cached_transformed_image = None
         self.high_performance_mode = True  # Default to high performance mode
         
+        # FPS tracking
+        self.fps_display_timer = QTimer()
+        self.fps_display_timer.setInterval(1000)  # Update every second
+        self.fps_display_timer.timeout.connect(self.update_fps_display)
+        self.current_fps = 0
+        
         # Set up the UI
         self.setup_ui()
+        
+        # Set initial display refresh rate based on performance mode
+        self.visualization.set_max_display_fps(60 if self.high_performance_mode else 30)
         
         # Connect signals
         self.connect_signals()
@@ -326,15 +335,27 @@ class ComputerVisionApp(QMainWindow):
             # Create and start the camera thread
             resolution_text = self.resolution_combo.currentText()
             width, height = map(int, resolution_text.split('x'))
+            camera_index = int(self.camera_combo.currentText().split(' ')[1])
             
-            self.camera_thread = CameraThread(self.model, width, height)
+            self.camera_thread = CameraThread(self.model, width, height, camera_index)
+            
+            # Set optimization options
+            self.camera_thread.set_adaptive_skipping(self.high_performance_mode)
+            self.camera_thread.set_max_skip_frames(3 if self.high_performance_mode else 1)
             
             # Connect signals
             self.camera_thread.new_frame.connect(self.update_frame)
             self.camera_thread.error.connect(self.handle_camera_error)
+            self.camera_thread.fps_update.connect(self.update_camera_fps)
+            
+            # Reset frame counter
+            self.frame_count = 0
             
             # Start thread
             self.camera_thread.start()
+            
+            # Start FPS display timer
+            self.fps_display_timer.start()
             
             # Update state and UI
             self.is_running = True
@@ -367,6 +388,9 @@ class ComputerVisionApp(QMainWindow):
         try:
             # Stop the thread
             self.camera_thread.stop()
+            
+            # Stop FPS display timer
+            self.fps_display_timer.stop()
             
             # Wait for a moment to ensure thread finishes
             for _ in range(10):
@@ -408,6 +432,9 @@ class ComputerVisionApp(QMainWindow):
         if image is None:
             return
             
+        # Increment frame counter for FPS calculation
+        self.frame_count += 1
+            
         # Check if it's time for garbage collection (every 10 seconds)
         current_time = time.time()
         if current_time - self.last_gc_time > 10:
@@ -419,51 +446,45 @@ class ComputerVisionApp(QMainWindow):
             # Store the current frame for later use
             self.current_frame = image
             
-            # Apply transforms to the image (if any)
-            transformed_image = self.apply_transforms(image)
+            # In high performance mode, skip transform processing for some frames
+            should_transform = True
+            if self.high_performance_mode:
+                should_transform = (self.frame_count % self.transform_every_n_frames == 0)
             
-            # In high performance mode, only process dual feed when necessary
-            should_process_original = True
-            if self.high_performance_mode and self.visualization.dual_mode:
-                # For dual mode, we can skip some processing of the original frame
-                # to maintain performance
-                self.frame_count += 1
-                if self.frame_count % 2 != 0:  # Process original every other frame
-                    should_process_original = False
-            
-            # Process frames with the current model
-            if self.model is not None:
-                # Process original frame if needed
-                if should_process_original:
-                    original_processed = self.model.process_frame(image)
-                    display_original = original_processed
-                else:
-                    # Use the last processed frame for original display
-                    display_original = getattr(self, 'last_original_processed', image)
-                
-                # Process transformed frame
-                transformed_processed = self.model.process_frame(transformed_image)
-                display_transformed = transformed_processed
-                
-                # Store for future frame skipping
-                self.last_original_processed = display_original
+            # Apply transforms to the image (if any and if not skipping)
+            if should_transform:
+                transformed_image = self.apply_transforms(image)
+                # Cache the transformed image for reuse
+                self.cached_transformed_image = transformed_image
             else:
-                # No model loaded, just display the original and transformed images
-                display_original = image
-                display_transformed = transformed_image
+                # Reuse cached transformed image if available
+                transformed_image = getattr(self, 'cached_transformed_image', image)
+            
+            # Determine if we should update the original display
+            # In dual mode with high performance, we can update the displays at different rates
+            should_update_original = True
+            should_update_transformed = True
+            
+            if self.high_performance_mode and self.visualization.dual_mode:
+                # For dual mode with high performance, we can skip some updates
+                if self.frame_count % 3 != 0:  # Skip some original frame updates
+                    should_update_original = False
+                if self.frame_count % 2 != 0:  # Skip some transformed frame updates
+                    should_update_transformed = False
             
             # Update displays based on current mode
             if self.visualization.dual_mode:
-                # In dual mode, update both displays
-                if should_process_original or not self.high_performance_mode:
-                    self.visualization.update_frame(display_original)
-                self.visualization.update_transformed_frame(display_transformed)
+                # In dual mode, update both displays selectively
+                if should_update_original:
+                    self.visualization.update_frame(image)
+                if should_update_transformed:
+                    self.visualization.update_transformed_frame(transformed_image)
             else:
                 # In single mode, only update the visible display
-                if self.visualization.video_label.isVisible():
-                    self.visualization.update_frame(display_original)
-                else:
-                    self.visualization.update_transformed_frame(display_transformed)
+                if self.visualization.video_label.isVisible() and should_update_original:
+                    self.visualization.update_frame(image)
+                elif self.visualization.transformed_label.isVisible() and should_update_transformed:
+                    self.visualization.update_transformed_frame(transformed_image)
             
         except Exception as e:
             self.update_status(f"Error updating frame: {str(e)}")
@@ -723,85 +744,97 @@ class ComputerVisionApp(QMainWindow):
         if not hasattr(self, 'transforms_panel') or self.transforms_panel is None:
             return image
             
-        # Performance optimizations
-        if self.high_performance_mode:
-            # Skip frames to improve performance
-            self.frame_count += 1
-            if self.frame_count % self.transform_every_n_frames != 0:
-                # Use cached transformed image if available
-                if self.cached_transformed_image is not None:
-                    return self.cached_transformed_image
-                    
-        # Check if any transform is actually enabled
+        # Check if any transform is actually enabled - skip everything if not
         if not self.transforms_panel.has_active_transforms():
             return image
-            
+        
         # Get current transform parameters
         current_params = self.transforms_panel.get_transform_params()
         
         # Use cached image if transform parameters haven't changed
         if (self.cached_transformed_image is not None and 
-            self.last_transform_params == current_params and
-            self.high_performance_mode):
+            self.last_transform_params == current_params):
             return self.cached_transformed_image
         
         # Store new parameters
         self.last_transform_params = current_params
             
-        # Convert QImage to numpy for transformations
-        width = image.width()
-        height = image.height()
-        
-        # In high performance mode, downscale before processing
-        scale_factor = 0.5 if self.high_performance_mode else 1.0
-        if scale_factor < 1.0:
-            width_scaled = int(width * scale_factor)
-            height_scaled = int(height * scale_factor)
-            # Scale down the image before processing
-            scaled_image = image.scaled(width_scaled, height_scaled, 
-                                       Qt.AspectRatioMode.IgnoreAspectRatio,
-                                       Qt.TransformationMode.FastTransformation)
-            ptr = scaled_image.constBits()
-            width = width_scaled
-            height = height_scaled
-        else:
-            ptr = image.constBits()
+        # Convert QImage to numpy for transformations - optimize this for speed
+        try:
+            # Get image dimensions
+            width = image.width()
+            height = image.height()
             
-        buf = memoryview(ptr).tobytes()
-        
-        # Reshape the buffer to match the image dimensions
-        if image.format() == QImage.Format_RGB888:
-            # 3 channels (RGB)
-            np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
-        else:
-            # Convert to RGB format first
-            rgb_image = image.convertToFormat(QImage.Format_RGB888)
+            # In high performance mode, downscale before processing
+            scale_factor = 0.75 if self.high_performance_mode else 1.0
+            
+            # Memory efficient conversion to numpy array
             if scale_factor < 1.0:
-                rgb_image = rgb_image.scaled(width_scaled, height_scaled, 
-                                           Qt.AspectRatioMode.IgnoreAspectRatio,
-                                           Qt.TransformationMode.FastTransformation)
-            ptr = rgb_image.constBits()
-            buf = memoryview(ptr).tobytes()
-            np_img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
-        
-        # Apply transformations
-        transformed_np = self.transforms_panel.apply_transforms(np_img)
-        
-        # Convert back to QImage
-        bytes_per_line = 3 * width
-        transformed_image = QImage(transformed_np.data, width, height, bytes_per_line, QImage.Format_RGB888)
-        
-        # If in high performance mode, scale back up to original size
-        if scale_factor < 1.0:
-            transformed_image = transformed_image.scaled(
-                image.width(), image.height(),
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
+                width_scaled = int(width * scale_factor)
+                height_scaled = int(height * scale_factor)
+                
+                # Fast scaling with QImage
+                scaled_image = image.scaled(
+                    width_scaled, height_scaled,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.FastTransformation
+                )
+                
+                # Convert to numpy directly
+                if scaled_image.format() == QImage.Format_RGB888:
+                    ptr = scaled_image.constBits()
+                    ptr.setsize(scaled_image.byteCount())
+                    np_img = np.array(ptr).reshape(height_scaled, width_scaled, 3)
+                else:
+                    # Convert to RGB format
+                    rgb_image = scaled_image.convertToFormat(QImage.Format_RGB888)
+                    ptr = rgb_image.constBits()
+                    ptr.setsize(rgb_image.byteCount())
+                    np_img = np.array(ptr).reshape(height_scaled, width_scaled, 3)
+            else:
+                # Convert directly without scaling
+                if image.format() == QImage.Format_RGB888:
+                    ptr = image.constBits()
+                    ptr.setsize(image.byteCount())
+                    np_img = np.array(ptr).reshape(height, width, 3)
+                else:
+                    rgb_image = image.convertToFormat(QImage.Format_RGB888)
+                    ptr = rgb_image.constBits()
+                    ptr.setsize(rgb_image.byteCount())
+                    np_img = np.array(ptr).reshape(height, width, 3)
             
-        # Cache the transformed image
-        self.cached_transformed_image = transformed_image
-        
-        return transformed_image
+            # Apply transformations
+            transformed_np = self.transforms_panel.apply_transforms(np_img)
+            
+            # Make sure the result is contiguous for efficient conversion to QImage
+            if not transformed_np.flags['C_CONTIGUOUS']:
+                transformed_np = np.ascontiguousarray(transformed_np)
+            
+            # Convert back to QImage efficiently
+            height, width, channels = transformed_np.shape
+            bytes_per_line = channels * width
+            transformed_image = QImage(
+                transformed_np.data,
+                width, height,
+                bytes_per_line,
+                QImage.Format_RGB888
+            )
+            
+            # If scaled down, scale back up to original size
+            if scale_factor < 1.0:
+                transformed_image = transformed_image.scaled(
+                    image.width(), image.height(),
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                
+            return transformed_image
+            
+        except Exception as e:
+            print(f"Error applying transforms: {e}")
+            import traceback
+            traceback.print_exc()
+            return image
 
     def update_visualization(self):
         """Update the visualization when transforms change"""
@@ -827,9 +860,32 @@ class ComputerVisionApp(QMainWindow):
 
     def toggle_performance_mode(self):
         """Toggle the performance mode"""
-        self.high_performance_mode = not self.high_performance_mode
-        self.performance_mode_check.setChecked(self.high_performance_mode)
-        self.update_status(f"Performance mode: {'High' if self.high_performance_mode else 'Low'}")
+        self.high_performance_mode = self.performance_mode_check.isChecked()
+        
+        # Update camera thread settings if running
+        if self.camera_thread is not None and self.camera_thread.isRunning():
+            self.camera_thread.set_adaptive_skipping(self.high_performance_mode)
+            self.camera_thread.set_max_skip_frames(3 if self.high_performance_mode else 0)
+            
+        # Update display refresh rate
+        if hasattr(self, 'visualization'):
+            self.visualization.set_max_display_fps(60 if self.high_performance_mode else 30)
+            
+        # Update status
+        self.update_status(f"Performance mode: {'High' if self.high_performance_mode else 'Quality'}")
+        
+        # Clear cached transformed image to force recalculation
+        self.cached_transformed_image = None
+
+    def update_fps_display(self):
+        """Update the FPS display"""
+        self.current_fps = self.frame_count
+        self.frame_count = 0
+        self.update_status(f"FPS: {self.current_fps}")
+
+    def update_camera_fps(self, fps):
+        """Update the camera FPS display"""
+        self.update_status(f"Camera FPS: {fps}")
 
 def main():
     """Application entry point"""
