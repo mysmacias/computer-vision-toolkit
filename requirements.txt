@@ -12,4 +12,6 @@ py-cpuinfo>=9.0.0  # For CPU information
 matplotlib>=3.3.0
 tqdm>=4.60.0 
 timm>=0.6.0  # For DINOv2 model support
-einops>=0.6.0  # For tensor operations with DINOv2 
+einops>=0.6.0  # For tensor operations with DINOv2
+pandas>=1.3.0  # For data analysis and CSV handling
+seaborn>=0.11.0  # For statistical data visualization 

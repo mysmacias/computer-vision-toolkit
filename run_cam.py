@@ -5,6 +5,7 @@ from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 import time
 import os
+import csv
 from datetime import datetime
 
 def main():
@@ -60,6 +61,21 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = os.path.join(output_dir, f"faster_rcnn_detection_{timestamp}.mp4")
     
+    # Create CSV output directory if it doesn't exist
+    csv_dir = 'detection_results'
+    if not os.path.exists(csv_dir):
+        os.makedirs(csv_dir)
+    
+    # Generate CSV filename with the same timestamp
+    csv_filename = os.path.join(csv_dir, f"detection_data_{timestamp}.csv")
+    
+    # Initialize CSV file and write header
+    with open(csv_filename, 'w', newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow(['frame_number', 'timestamp', 'class_id', 'class_name', 'confidence', 'x_min', 'y_min', 'x_max', 'y_max', 'processing_time'])
+    
+    print(f"Recording detection data to: {csv_filename}")
+    
     # Initialize video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4 format
     out = cv2.VideoWriter(output_filename, fourcc, fps, (frame_width, frame_height))
@@ -109,33 +125,55 @@ def main():
             pred_scores = predictions[0]['scores'].cpu().numpy()
             pred_labels = predictions[0]['labels'].cpu().numpy()
             
-            # Step 7: Draw bounding boxes and labels on the frame
-            for box, score, label in zip(pred_boxes, pred_scores, pred_labels):
-                if score >= detection_threshold:
-                    # Draw bounding box
-                    cv2.rectangle(
-                        frame_with_detections,
-                        (box[0], box[1]),
-                        (box[2], box[3]),
-                        (0, 255, 0),  # Green color
-                        2  # Line thickness
-                    )
-                    
-                    # Draw label and score
-                    label_name = COCO_INSTANCE_CATEGORY_NAMES[label]
-                    label_text = f"{label_name}: {score:.2f}"
-                    cv2.putText(
-                        frame_with_detections,
-                        label_text,
-                        (box[0], box[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,  # Font scale
-                        (255, 255, 255),  # White color
-                        2  # Line thickness
-                    )
+            # Calculate processing time for this frame
+            processing_time = time.time() - start_time
+            frame_timestamp = time.time() - recording_start_time
+            
+            # Open CSV file to append detection results
+            with open(csv_filename, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                
+                # Step 7: Draw bounding boxes and labels on the frame and save to CSV
+                for box, score, label in zip(pred_boxes, pred_scores, pred_labels):
+                    if score >= detection_threshold:
+                        # Draw bounding box
+                        cv2.rectangle(
+                            frame_with_detections,
+                            (box[0], box[1]),
+                            (box[2], box[3]),
+                            (0, 255, 0),  # Green color
+                            2  # Line thickness
+                        )
+                        
+                        # Draw label and score
+                        label_name = COCO_INSTANCE_CATEGORY_NAMES[label]
+                        label_text = f"{label_name}: {score:.2f}"
+                        cv2.putText(
+                            frame_with_detections,
+                            label_text,
+                            (box[0], box[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,  # Font scale
+                            (255, 255, 255),  # White color
+                            2  # Line thickness
+                        )
+                        
+                        # Write to CSV: frame_number, timestamp, class_id, class_name, confidence, x_min, y_min, x_max, y_max, processing_time
+                        csv_writer.writerow([
+                            frame_count,
+                            f"{frame_timestamp:.3f}",
+                            int(label),
+                            label_name,
+                            f"{score:.4f}",
+                            box[0],
+                            box[1],
+                            box[2],
+                            box[3],
+                            f"{processing_time:.4f}"
+                        ])
             
             # Calculate and display FPS
-            processing_fps = 1.0 / (time.time() - start_time)
+            processing_fps = 1.0 / processing_time
             
             # Add recording indicator and FPS
             elapsed_time = time.time() - recording_start_time
@@ -193,6 +231,7 @@ def main():
         print(f"Recording completed: {frame_count} frames processed in {recording_duration:.2f} seconds")
         print(f"Average FPS: {frame_count / recording_duration:.2f}")
         print(f"Video saved to: {output_filename}")
+        print(f"Detection data saved to: {csv_filename}")
 
 if __name__ == "__main__":
     # Check if PyTorch and required libraries are available
